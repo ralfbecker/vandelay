@@ -160,11 +160,11 @@ vandelay import imap \
   [--include <REGEX>...] [--exclude <REGEX>...] [--exclude-special <ROLE>...] \
   [--folder <NAME>...] [--subscribed-only] [--noautomap] \
   [--include-deleted] [--allow-cleartext] [--compress] \
-  [--fetch-batch <N>] [--imap-connections <1..8>] \
+  [--fetch-batch <N>] [--imap-connections <1..8>] [--acl] \
   <ARCHIVE>
 ```
 
-Imports mail (and only mail) from any IMAP server. Folder selection is via `--include`/`--exclude` regexes (mutually exclusive with the exact-match `--folder`); `--exclude-special` drops by SPECIAL-USE role.
+Imports mail (and only mail) from any IMAP server. Folder selection is via `--include`/`--exclude` regexes (mutually exclusive with the exact-match `--folder`); `--exclude-special` drops by SPECIAL-USE role. `--acl` additionally captures each mailbox's RFC 4314 `GETACL` entries (requires the server to advertise the ACL capability); pair with `export --acl` to carry mailbox sharing over to the target.
 
 #### CalDAV
 
@@ -270,13 +270,15 @@ vandelay export \
   --url <URL> \
   (--auth-basic <USER> [--auth-password <PASS>] | --auth-bearer [TOKEN]) \
   (--account-id <ID> | --account-name <NAME>) \
-  [--objects <list>] [--prune [--yes]] \
+  [--objects <list>] [--prune [--yes]] [--acl] \
   <ARCHIVE>
 ```
 
 Stateless re-export of `ARCHIVE` into a target JMAP server account. The default behaviour is upsert-only: matched items are updated, unmatched local items are created, but pre-existing target items not covered by the archive are left alone.
 
 `--prune` enables destructive reconciliation: target objects that do not match anything in the archive are deleted. The confirmation prompt can be skipped with `--yes` for automation. Export speaks JMAP only; no other target protocols are currently supported.
+
+`--acl` pushes mailbox ACLs captured by `import imap --acl` to the target as JMAP `Mailbox` `shareWith`, merging into whatever the target mailbox already has rather than replacing it outright. Requires the target to advertise `urn:ietf:params:jmap:mail:share` and `urn:ietf:params:jmap:principals`; otherwise it's silently skipped.
 
 ### Inspect
 
