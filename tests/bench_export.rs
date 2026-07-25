@@ -167,6 +167,7 @@ fn run_export(threads: usize, target_id: &str, localpart: &str) -> Run {
         objects: None,
         prune: false,
         yes: true,
+        acl: false,
     };
 
     let started = Instant::now();
@@ -294,6 +295,7 @@ fn bench_export_remote() {
             ]),
             prune: false,
             yes: true,
+            acl: false,
         };
         let started = Instant::now();
         let summary = sync::export::run(common, config).expect("remote export");

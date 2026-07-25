@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::db;
 use crate::db::init;
 use crate::error::Error;
 use crate::types::ObjectType;
@@ -105,6 +106,17 @@ fn write_summary(conn: &Connection, archive: &Path, out: &mut impl Write) -> Res
         lw = label_width,
         cw = count_width
     )?;
+    let acl_count = db::acls::count(conn)?;
+    if acl_count > 0 {
+        writeln!(
+            out,
+            "  {:<lw$}  {:>cw$}",
+            "mailbox_acls",
+            format_count(acl_count as u64),
+            lw = label_width.max("mailbox_acls".len()),
+            cw = count_width
+        )?;
+    }
     Ok(())
 }
 
@@ -272,6 +284,26 @@ mod tests {
         }
         assert!(s.contains("blobs"));
         assert!(s.contains("10 B"));
+        assert!(!s.contains("mailbox_acls"), "no ACL rows: line should be omitted");
+    }
+
+    #[test]
+    fn summary_shows_mailbox_acls_line_only_when_present() {
+        let c = mem();
+        c.execute("INSERT INTO mailboxes (name) VALUES (?1)", params!["Inbox"])
+            .unwrap();
+        let mailbox_id = c.last_insert_rowid();
+        crate::db::acls::replace_for_mailbox(
+            &c,
+            mailbox_id,
+            &[("jdoe@example.com".to_owned(), "lr".to_owned())],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        write_summary(&c, Path::new("test.sqlite"), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("mailbox_acls"));
+        assert!(s.contains('1'));
     }
 
     #[test]

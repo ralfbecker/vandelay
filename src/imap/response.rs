@@ -90,6 +90,10 @@ pub enum Untagged {
         mailbox: String,
         items: BTreeMap<String, u64>,
     },
+    Acl {
+        mailbox: String,
+        entries: Vec<(String, String)>,
+    },
     Search(Vec<u32>),
     Esearch {
         tag: Option<String>,
@@ -266,6 +270,38 @@ impl<'r, R: BufRead> Parser<'r, R> {
                 }
                 self.expect(b')')?;
                 Ok(Untagged::Status { mailbox, items })
+            }
+            // RFC 4314: `* ACL mailbox *(identifier rights)`. identifier can
+            // be a quoted string or literal (e.g. an email address), not
+            // just a bare atom, so it goes through parse_value() like the
+            // mailbox name rather than read_atom_string().
+            "ACL" => {
+                self.skip_ws();
+                let mailbox = match self.parse_value()? {
+                    Value::Str(s) | Value::Atom(s) => s,
+                    Value::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                    _ => return Err(ImapError::Parse("ACL mailbox missing".into())),
+                };
+                let mut entries = Vec::new();
+                while !self.at_end() {
+                    self.skip_ws();
+                    if self.at_end() {
+                        break;
+                    }
+                    let identifier = match self.parse_value()? {
+                        Value::Str(s) | Value::Atom(s) => s,
+                        Value::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                        _ => return Err(ImapError::Parse("ACL identifier missing".into())),
+                    };
+                    self.skip_ws();
+                    let rights = match self.parse_value()? {
+                        Value::Str(s) | Value::Atom(s) => s,
+                        Value::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                        _ => return Err(ImapError::Parse("ACL rights missing".into())),
+                    };
+                    entries.push((identifier, rights));
+                }
+                Ok(Untagged::Acl { mailbox, entries })
             }
             "SEARCH" => {
                 let mut ids = Vec::new();
@@ -873,6 +909,81 @@ mod tests {
                 assert_eq!(items.get("MESSAGES"), Some(&7));
             }
             _ => panic!("expected Status"),
+        }
+    }
+
+    #[test]
+    fn untagged_acl_with_bare_atom_identifiers() {
+        let r = parse(b"* ACL INBOX jdoe lrswikta anyone lr\r\n");
+        match r {
+            Response::Untagged(Untagged::Acl { mailbox, entries }) => {
+                assert_eq!(mailbox, "INBOX");
+                assert_eq!(
+                    entries,
+                    vec![
+                        ("jdoe".to_owned(), "lrswikta".to_owned()),
+                        ("anyone".to_owned(), "lr".to_owned()),
+                    ]
+                );
+            }
+            _ => panic!("expected Acl"),
+        }
+    }
+
+    #[test]
+    fn untagged_acl_with_quoted_or_literal_identifier() {
+        let r = parse(b"* ACL \"INBOX\" \"jdoe@example.com\" lrswikta\r\n");
+        match r {
+            Response::Untagged(Untagged::Acl { mailbox, entries }) => {
+                assert_eq!(mailbox, "INBOX");
+                assert_eq!(
+                    entries,
+                    vec![("jdoe@example.com".to_owned(), "lrswikta".to_owned())]
+                );
+            }
+            _ => panic!("expected Acl"),
+        }
+
+        let r = parse(b"* ACL INBOX {17}\r\njdoe2@example.com lr\r\n");
+        match r {
+            Response::Untagged(Untagged::Acl { mailbox, entries }) => {
+                assert_eq!(mailbox, "INBOX");
+                assert_eq!(
+                    entries,
+                    vec![("jdoe2@example.com".to_owned(), "lr".to_owned())]
+                );
+            }
+            _ => panic!("expected Acl"),
+        }
+    }
+
+    #[test]
+    fn untagged_acl_keeps_negative_rights_prefix_on_identifier() {
+        let r = parse(b"* ACL \"Shared/Team\" -anyone lrs jdoe lrswikta\r\n");
+        match r {
+            Response::Untagged(Untagged::Acl { mailbox, entries }) => {
+                assert_eq!(mailbox, "Shared/Team");
+                assert_eq!(
+                    entries,
+                    vec![
+                        ("-anyone".to_owned(), "lrs".to_owned()),
+                        ("jdoe".to_owned(), "lrswikta".to_owned()),
+                    ]
+                );
+            }
+            _ => panic!("expected Acl"),
+        }
+    }
+
+    #[test]
+    fn untagged_acl_with_no_entries() {
+        let r = parse(b"* ACL INBOX\r\n");
+        match r {
+            Response::Untagged(Untagged::Acl { mailbox, entries }) => {
+                assert_eq!(mailbox, "INBOX");
+                assert!(entries.is_empty());
+            }
+            _ => panic!("expected Acl"),
         }
     }
 

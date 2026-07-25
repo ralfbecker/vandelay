@@ -318,6 +318,12 @@ struct ImapImportArgs {
     )]
     allow_source_change: bool,
 
+    #[arg(
+        long,
+        help = "Fetch per-mailbox GETACL entries (requires server ACL capability)"
+    )]
+    acl: bool,
+
     #[command(flatten)]
     global: GlobalArgs,
 
@@ -371,6 +377,12 @@ struct ExportArgs {
 
     #[arg(long, help = "Skip the interactive --prune confirmation")]
     yes: bool,
+
+    #[arg(
+        long,
+        help = "Export mailbox ACLs as JMAP shareWith (requires target mail-sharing support)"
+    )]
+    acl: bool,
 
     #[command(flatten)]
     global: GlobalArgs,
@@ -834,6 +846,7 @@ fn resolve_imap_import(args: ImapImportArgs) -> Result<Action, Error> {
             fetch_batch: args.fetch_batch,
             imap_connections,
             allow_source_change: args.allow_source_change,
+            acl: args.acl,
         },
     ))
 }
@@ -902,6 +915,7 @@ fn resolve_export(args: ExportArgs) -> Result<Action, Error> {
             objects,
             prune: args.prune,
             yes: args.yes,
+            acl: args.acl,
         },
     ))
 }

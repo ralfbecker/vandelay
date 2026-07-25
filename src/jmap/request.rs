@@ -44,11 +44,24 @@ pub struct MethodCall {
 #[derive(Debug, Clone, Default)]
 pub struct Request {
     calls: Vec<MethodCall>,
+    extra_using: Vec<String>,
 }
 
 impl Request {
     pub fn new() -> Request {
-        Request { calls: Vec::new() }
+        Request {
+            calls: Vec::new(),
+            extra_using: Vec::new(),
+        }
+    }
+
+    /// Declares an additional capability in "using" beyond what `using_urn`
+    /// infers from method-name prefixes. Needed for capabilities that
+    /// extend an existing type's properties without their own methods,
+    /// e.g. `urn:ietf:params:jmap:mail:share` for Mailbox's `shareWith`.
+    pub fn require(&mut self, urn: impl Into<String>) -> &mut Request {
+        self.extra_using.push(urn.into());
+        self
     }
 
     pub fn call(
@@ -78,6 +91,9 @@ impl Request {
         set.insert(URN_CORE.to_owned());
         for c in &self.calls {
             set.insert(using_urn(&c.name).to_owned());
+        }
+        for urn in &self.extra_using {
+            set.insert(urn.clone());
         }
         set.into_iter().collect()
     }
@@ -536,6 +552,10 @@ pub struct SetRequest<'a> {
     pub update: Option<Value>,
     pub destroy: Option<Value>,
     pub extra_args: &'a [(&'a str, Value)],
+    /// Extra capability URNs to declare in "using" beyond what the type
+    /// name implies (see `Request::require`), e.g. `mail:share` for a
+    /// Mailbox `shareWith` update.
+    pub extra_using: &'a [&'a str],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -579,6 +599,7 @@ pub fn set_call(
             type_name,
             &[],
             body.extra_args,
+            body.extra_using,
             limits,
         );
     }
@@ -595,6 +616,7 @@ pub fn set_call(
             type_name,
             &items[start..end],
             body.extra_args,
+            body.extra_using,
             limits,
         )?;
         outcome.absorb(part);
@@ -603,6 +625,7 @@ pub fn set_call(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_send(
     client: &HttpClient,
     api_url: &str,
@@ -610,6 +633,7 @@ fn set_send(
     type_name: &str,
     items: &[(Section, String, Value)],
     extra_args: &[(&str, Value)],
+    extra_using: &[&str],
     limits: &Limits,
 ) -> Result<SetOutcome, JmapError> {
     let mut args = Map::new();
@@ -642,6 +666,9 @@ fn set_send(
     }
     let mut req = Request::new();
     req.call(format!("{type_name}/set"), Value::Object(args), "s");
+    for urn in extra_using {
+        req.require(*urn);
+    }
 
     let oversize = req.fits(limits).is_err();
     let send_result = if oversize {
@@ -670,6 +697,7 @@ fn set_send(
                 type_name,
                 &items[..mid],
                 extra_args,
+                extra_using,
                 limits,
             )?;
             let right = set_send(
@@ -679,6 +707,7 @@ fn set_send(
                 type_name,
                 &items[mid..],
                 extra_args,
+                extra_using,
                 limits,
             )?;
             left.absorb(right);
@@ -735,6 +764,16 @@ mod tests {
         assert!(u.contains(&URN_CORE.to_owned()));
         assert!(u.contains(&"urn:ietf:params:jmap:mail".to_owned()));
         assert_eq!(u.iter().filter(|x| x.as_str() == URN_CORE).count(), 1);
+    }
+
+    #[test]
+    fn require_adds_a_capability_beyond_the_method_prefix_mapping() {
+        let mut r = Request::new();
+        r.call("Mailbox/set", json!({}), "s");
+        r.require("urn:ietf:params:jmap:mail:share");
+        let u = r.using();
+        assert!(u.contains(&"urn:ietf:params:jmap:mail".to_owned()));
+        assert!(u.contains(&"urn:ietf:params:jmap:mail:share".to_owned()));
     }
 
     #[test]

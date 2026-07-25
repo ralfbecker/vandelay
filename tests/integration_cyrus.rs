@@ -39,6 +39,7 @@ fn imap_config(account: &Account, imap: &Endpoint) -> ImapImportConfig {
         fetch_batch: 64,
         imap_connections: 2,
         allow_source_change: false,
+        acl: false,
     }
 }
 

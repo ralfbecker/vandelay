@@ -155,6 +155,7 @@ fn export_email_already_exists_is_matched_not_failed() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -296,6 +297,7 @@ fn export_mailbox_name_collision_merges_without_create() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -454,6 +456,7 @@ fn export_mailbox_already_exists_maps_existing_id() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -611,6 +614,7 @@ fn email_export_sends_one_email_per_import_call() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -778,6 +782,7 @@ fn export_email_blob_not_found_reuploads_and_retries() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -914,6 +919,7 @@ fn export_email_parallel_imports_each_email() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -1049,6 +1055,7 @@ fn export_email_parallel_thousand_emails() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -1187,6 +1194,7 @@ fn export_email_parallel_blob_not_found_self_heals() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -1370,6 +1378,7 @@ fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ExportConfig {
         objects: Some(objects),
         prune: false,
         yes: true,
+        acl: false,
     }
 }
 
@@ -3919,6 +3928,7 @@ fn export_email_batches_blob_upload_when_server_supports_it() {
             objects: None,
             prune: false,
             yes: true,
+            acl: false,
         },
     )
     .expect("export run");
@@ -3935,5 +3945,410 @@ fn export_email_batches_blob_upload_when_server_supports_it() {
     uploads.assert();
     blob_calls.assert();
     imports.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+fn acl_session_body(base: &str) -> String {
+    json!({
+        "apiUrl": format!("{base}/jmap/api"),
+        "uploadUrl": format!("{base}/jmap/upload/{{accountId}}/"),
+        "downloadUrl": format!("{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}"),
+        "capabilities": {
+            "urn:ietf:params:jmap:core": {
+                "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
+                "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
+                "maxSizeRequest": 10000000, "maxSizeUpload": 50000000
+            },
+            "urn:ietf:params:jmap:principals": {}
+        },
+        "accounts": { "w": { "name": "alice",
+            "accountCapabilities": {
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:mail:share": {}
+            } } }
+    })
+    .to_string()
+}
+
+fn acl_export_config(base: &str) -> ExportConfig {
+    ExportConfig {
+        acl: true,
+        ..export_cfg_objects(base, vec![ObjectType::Mailbox])
+    }
+}
+
+/// Mocks the tree.rs Mailbox-matching round trip: a Mailbox/query returning
+/// one existing target id, then a Mailbox/get (requesting myRights) that
+/// matches it to the local "Inbox" mailbox by name, so no Mailbox/set create
+/// is issued for the mailbox itself.
+fn mock_matched_inbox(server: &mut mockito::Server, api: &str) -> (mockito::Mock, mockito::Mock, mockito::Mock) {
+    let mq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["t1"]},"q"]]}).to_string())
+        .expect(1)
+        .create();
+    // query_all_ids always issues an anchor-based follow-up query after any
+    // non-empty page to confirm there's no more; without this, it loops
+    // forever re-requesting the same non-empty page (see anchor_terminator).
+    let _mq_end = anchor_terminator(server, api, "Mailbox");
+    let mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("myRights".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+                {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
+                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    (mq, _mq_end, mg)
+}
+
+#[test]
+fn export_acl_skips_when_target_lacks_sharing_capabilities() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        db::acls::replace_for_mailbox(
+            &conn,
+            1,
+            &[("jdoe@example.com".to_owned(), "lr".to_owned())],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        // The plain session_body has no mail:share / principals capability.
+        .with_body(session_body(&base))
+        .create();
+    let _pq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Principal/query".into()))
+        .with_body(json!({"methodResponses":[]}).to_string())
+        .expect(0)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            acl: true,
+            ..export_cfg_objects(&base, vec![])
+        },
+    )
+    .expect("export");
+
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 0);
+    assert_eq!(acl_counts.1.failed, 0);
+    _pq.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_acl_pushes_share_with_computed_from_imap_rights() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        db::acls::replace_for_mailbox(
+            &conn,
+            1,
+            &[("jdoe@example.com".to_owned(), "lrswikta".to_owned())],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(acl_session_body(&base))
+        .create();
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
+    let _pq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Principal/query".into()))
+        .with_body(
+            json!({"methodResponses":[
+                ["Principal/query", {"accountId":"w","ids":["p1"]}, "q0"],
+                ["Principal/get", {"accountId":"w",
+                    "list":[{"id":"p1","email":"jdoe@example.com"}],"notFound":[]}, "g0"]
+            ]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _current = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("shareWith".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",
+                {"accountId":"w","list":[{"id":"t1","shareWith":null}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/set".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",
+                {"accountId":"w","updated":{"t1":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(common(&archive), acl_export_config(&base)).expect("export");
+
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 1);
+    assert_eq!(acl_counts.1.failed, 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_acl_merges_with_shares_already_on_the_target() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        // Only "jdoe@example.com" is known to the local archive.
+        db::acls::replace_for_mailbox(
+            &conn,
+            1,
+            &[("jdoe@example.com".to_owned(), "lr".to_owned())],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(acl_session_body(&base))
+        .create();
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
+    let _pq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Principal/query".into()))
+        .with_body(
+            json!({"methodResponses":[
+                ["Principal/query", {"accountId":"w","ids":["p1"]}, "q0"],
+                ["Principal/get", {"accountId":"w",
+                    "list":[{"id":"p1","email":"jdoe@example.com"}],"notFound":[]}, "g0"]
+            ]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    // The target already shares this mailbox with "p2", a principal the
+    // local archive knows nothing about (e.g. granted natively).
+    let _current = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("shareWith".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",
+                {"accountId":"w","list":[{"id":"t1",
+                    "shareWith":{"p2":{"mayShare":true}}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    // "p1" sorts before "p2" (serde_json::Map without preserve_order is a
+    // BTreeMap, so keys serialize alphabetically): both must be present.
+    let _set = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/set".into()),
+            Matcher::Regex(r#""p1":\{"#.into()),
+            Matcher::Regex(r#""p2":\{"mayShare":true\}"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",
+                {"accountId":"w","updated":{"t1":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(common(&archive), acl_export_config(&base)).expect("export");
+
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 1);
+    assert_eq!(acl_counts.1.failed, 0);
+    _set.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_acl_unresolvable_identifier_is_skipped_not_fatal() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        db::acls::replace_for_mailbox(
+            &conn,
+            1,
+            &[
+                ("jdoe@example.com".to_owned(), "lr".to_owned()),
+                ("ghost@example.com".to_owned(), "lr".to_owned()),
+            ],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(acl_session_body(&base))
+        .create();
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
+    // "ghost@example.com" has no matching principal on the target.
+    let _pq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Principal/query".into()))
+        .with_body(
+            json!({"methodResponses":[
+                ["Principal/query", {"accountId":"w","ids":["p1"]}, "q0"],
+                ["Principal/get", {"accountId":"w",
+                    "list":[{"id":"p1","email":"jdoe@example.com"}],"notFound":[]}, "g0"],
+                ["Principal/query", {"accountId":"w","ids":[]}, "q1"],
+                ["Principal/get", {"accountId":"w","list":[],"notFound":[]}, "g1"]
+            ]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _current = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("shareWith".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",
+                {"accountId":"w","list":[{"id":"t1","shareWith":null}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    // Only "p1" (jdoe) should end up in the update; "ghost" is silently
+    // dropped rather than failing the whole mailbox.
+    let _set = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/set".into()),
+            Matcher::Regex(r#""p1":\{"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",
+                {"accountId":"w","updated":{"t1":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(common(&archive), acl_export_config(&base)).expect("export");
+
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 1, "the mailbox update still goes through");
+    assert_eq!(acl_counts.1.failed, 0, "an unresolved identifier isn't a failure");
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_acl_dry_run_issues_no_mailbox_set() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        db::acls::replace_for_mailbox(
+            &conn,
+            1,
+            &[("jdoe@example.com".to_owned(), "lr".to_owned())],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(acl_session_body(&base))
+        .create();
+    // --dry-run still plans the Mailbox match (read-only) but must never
+    // reach the ACL phase's writes.
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
+    let _set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/set".into()))
+        .expect(0)
+        .create();
+    let _pq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Principal/query".into()))
+        .expect(0)
+        .create();
+
+    sync::export::run(common_dry(&archive), acl_export_config(&base)).expect("dry-run export");
+
+    _set.assert();
+    _pq.assert();
     let _ = std::fs::remove_file(&archive);
 }

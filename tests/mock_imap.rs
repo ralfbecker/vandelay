@@ -169,6 +169,7 @@ fn run_import(
         fetch_batch: 256,
         imap_connections: 1,
         allow_source_change: false,
+        acl: false,
     };
     config_tweak(&mut config);
     run(common, config)
@@ -788,6 +789,265 @@ fn coordinator_uidvalidity_change_wipes_folder_emails() {
         .clone();
     assert_eq!(email_after.deleted, 1, "stale UV emails wiped");
     assert_eq!(email_after.created, 1, "re-imported under new UV");
+}
+
+#[test]
+fn coordinator_acl_flag_fetches_and_stores_getacl() {
+    let control: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN ACL")?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LIST \"\" \"*\"");
+        conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+        conn.write_line(&format!("{tag} OK LIST done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LSUB \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "GETACL \"INBOX\"");
+        conn.write_line("* ACL \"INBOX\" jdoe lrswikta anyone lr")?;
+        conn.write_line(&format!("{tag} OK GETACL done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "SELECT \"INBOX\"");
+        write_select(conn, &tag, 100, 1, 0)?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "UID SEARCH ALL");
+        conn.write_line("* SEARCH")?;
+        conn.write_line(&format!("{tag} OK SEARCH done"))?;
+        drain_until_close(conn);
+        Ok(())
+    });
+    let server = MockImap::start_scripts(vec![control]);
+    let archive = tempfile("acl_happy");
+    let summary = run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("import");
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 1);
+    assert_eq!(acl_counts.1.failed, 0);
+    let conn = Connection::open(&archive).unwrap();
+    db::init::apply_schema(&conn).unwrap();
+    let mailbox_id: i64 = conn
+        .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let rows = db::acls::for_mailbox(&conn, mailbox_id).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("anyone".to_owned(), "lr".to_owned()),
+            ("jdoe".to_owned(), "lrswikta".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn coordinator_acl_flag_without_server_capability_warns_and_skips() {
+    let control: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        // No "ACL" token in the capability string.
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN")?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LIST \"\" \"*\"");
+        conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+        conn.write_line(&format!("{tag} OK LIST done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LSUB \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        // No GETACL expected here: if the coordinator sent one anyway, this
+        // assertion (expecting SELECT next) would catch it.
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "SELECT \"INBOX\"");
+        write_select(conn, &tag, 100, 1, 0)?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "UID SEARCH ALL");
+        conn.write_line("* SEARCH")?;
+        conn.write_line(&format!("{tag} OK SEARCH done"))?;
+        drain_until_close(conn);
+        Ok(())
+    });
+    let server = MockImap::start_scripts(vec![control]);
+    let archive = tempfile("acl_unsupported");
+    run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("import");
+    let conn = Connection::open(&archive).unwrap();
+    db::init::apply_schema(&conn).unwrap();
+    assert_eq!(db::acls::count(&conn).unwrap(), 0);
+}
+
+#[test]
+fn coordinator_acl_getacl_failure_for_one_folder_continues() {
+    let control: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN ACL")?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LIST \"\" \"*\"");
+        conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+        conn.write_line("* LIST () \"/\" \"Archive\"")?;
+        conn.write_line(&format!("{tag} OK LIST done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LSUB \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        // Same-depth folders are visited in name order ("Archive" < "INBOX").
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "GETACL \"Archive\"");
+        conn.write_line(&format!("{tag} NO permission denied"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "GETACL \"INBOX\"");
+        conn.write_line("* ACL \"INBOX\" jdoe lr")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "SELECT \"Archive\"");
+        write_select(conn, &tag, 200, 1, 0)?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "UID SEARCH ALL");
+        conn.write_line("* SEARCH")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "NOOP");
+        conn.write_line(&format!("{tag} OK"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "SELECT \"INBOX\"");
+        write_select(conn, &tag, 100, 1, 0)?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "UID SEARCH ALL");
+        conn.write_line("* SEARCH")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        drain_until_close(conn);
+        Ok(())
+    });
+    let server = MockImap::start_scripts(vec![control]);
+    let archive = tempfile("acl_partial_failure");
+    let summary = run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("import");
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 1, "INBOX succeeded");
+    assert_eq!(acl_counts.1.failed, 1, "Archive GETACL failed");
+    assert!(
+        summary.any_failed(),
+        "a failed ACL fetch should mark the run as failed"
+    );
+    let conn = Connection::open(&archive).unwrap();
+    db::init::apply_schema(&conn).unwrap();
+    let inbox_id: i64 = conn
+        .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let archive_id: i64 = conn
+        .query_row("SELECT id FROM mailboxes WHERE name = 'Archive'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(db::acls::for_mailbox(&conn, archive_id).unwrap().is_empty());
+    assert_eq!(
+        db::acls::for_mailbox(&conn, inbox_id).unwrap(),
+        vec![("jdoe".to_owned(), "lr".to_owned())]
+    );
+}
+
+#[test]
+fn coordinator_acl_rerun_replaces_wholesale() {
+    fn control_script(reply: &'static str) -> Script {
+        Box::new(move |conn: &mut MockConn| -> std::io::Result<()> {
+            auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN ACL")?;
+            let (tag, cmd) = conn.read_command()?;
+            assert_eq!(cmd, "LIST \"\" \"*\"");
+            conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+            conn.write_line(&format!("{tag} OK LIST done"))?;
+            let (tag, cmd) = conn.read_command()?;
+            assert_eq!(cmd, "LSUB \"\" \"*\"");
+            conn.write_line(&format!("{tag} OK LSUB done"))?;
+            let (tag, cmd) = conn.read_command()?;
+            assert_eq!(cmd, "GETACL \"INBOX\"");
+            conn.write_line(&format!("* ACL \"INBOX\" {reply}"))?;
+            conn.write_line(&format!("{tag} OK"))?;
+            let (tag, cmd) = conn.read_command()?;
+            assert_eq!(cmd, "SELECT \"INBOX\"");
+            write_select(conn, &tag, 100, 1, 0)?;
+            let (tag, cmd) = conn.read_command()?;
+            assert_eq!(cmd, "UID SEARCH ALL");
+            conn.write_line("* SEARCH")?;
+            conn.write_line(&format!("{tag} OK"))?;
+            drain_until_close(conn);
+            Ok(())
+        })
+    }
+    let server = MockImap::start_scripts(vec![
+        control_script("jdoe lrswikta anyone lr"),
+        control_script("jdoe lr"),
+    ]);
+    let archive = tempfile("acl_rerun");
+    run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("first import");
+    run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("second import");
+    let conn = Connection::open(&archive).unwrap();
+    db::init::apply_schema(&conn).unwrap();
+    let mailbox_id: i64 = conn
+        .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        db::acls::for_mailbox(&conn, mailbox_id).unwrap(),
+        vec![("jdoe".to_owned(), "lr".to_owned())],
+        "stale 'anyone' entry and the old, wider rights must be gone"
+    );
+}
+
+#[test]
+fn coordinator_acl_cascade_deletes_with_vanished_folder() {
+    let run1: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN ACL")?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LIST \"\" \"*\"");
+        conn.write_line("* LIST () \"/\" \"Old\"")?;
+        conn.write_line(&format!("{tag} OK LIST done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LSUB \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "GETACL \"Old\"");
+        conn.write_line("* ACL \"Old\" jdoe lr")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "SELECT \"Old\"");
+        write_select(conn, &tag, 100, 1, 0)?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "UID SEARCH ALL");
+        conn.write_line("* SEARCH")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        drain_until_close(conn);
+        Ok(())
+    });
+    let run2: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN ACL")?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LIST \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LIST done"))?; // "Old" no longer exists
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LSUB \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        drain_until_close(conn);
+        Ok(())
+    });
+    let server = MockImap::start_scripts(vec![run1, run2]);
+    let archive = tempfile("acl_cascade");
+    run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("first import");
+    let conn = Connection::open(&archive).unwrap();
+    db::init::apply_schema(&conn).unwrap();
+    assert_eq!(db::acls::count(&conn).unwrap(), 1);
+    drop(conn);
+
+    run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("second import");
+    let conn = Connection::open(&archive).unwrap();
+    assert_eq!(count(&conn, "mailboxes"), 0, "Old should have vanished");
+    assert_eq!(
+        db::acls::count(&conn).unwrap(),
+        0,
+        "ON DELETE CASCADE should have removed its ACL row too"
+    );
 }
 
 #[test]

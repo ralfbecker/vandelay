@@ -190,6 +190,7 @@ pub struct ImapImportConfig {
     pub fetch_batch: usize,
     pub imap_connections: usize,
     pub allow_source_change: bool,
+    pub acl: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -353,11 +354,32 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
 
     let mut mailbox_counts = TypeCounts::default();
     let mut email_counts = TypeCounts::default();
+    let mut mailbox_acl_counts = TypeCounts::default();
 
     let local_mailboxes = db::imap_ids::mailbox_folders(&conn, source_id)?;
     let server_folder_set: HashSet<String> = resolved.iter().map(|f| f.name.clone()).collect();
 
     upsert_mailboxes(&mut conn, source_id, &resolved, &mut mailbox_counts)?;
+
+    if config.acl {
+        if client.has_capability("ACL") {
+            fetch_acls(
+                &mut conn,
+                &mut client,
+                &control_ctx,
+                source_id,
+                &resolved,
+                &mut mailbox_acl_counts,
+                logger,
+            )?;
+        } else {
+            log_at(
+                logger,
+                LEVEL_DEFAULT,
+                "--acl requested but server does not advertise ACL capability; skipping",
+            );
+        }
+    }
 
     let server_delimiter = resolved.iter().find_map(|f| f.delimiter).unwrap_or('/');
 
@@ -425,10 +447,64 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     let _ = client.logout();
 
     Ok(Summary {
-        per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
+        per_type: vec![
+            ("mailbox", mailbox_counts),
+            ("email", email_counts),
+            ("mailbox_acl", mailbox_acl_counts),
+        ],
         retries_observed: backoff.total_retries(),
         retry_after_sleeps: backoff.transient_retries() as u64,
     })
+}
+
+fn fetch_acls(
+    conn: &mut Connection,
+    client: &mut ImapClient,
+    control_ctx: &ControlCtx,
+    source_id: i64,
+    folders: &[ResolvedFolder],
+    counts: &mut TypeCounts,
+    logger: Logger,
+) -> Result<(), Error> {
+    for folder in folders {
+        let Some(mailbox_local) = db::imap_ids::local_for_mailbox(conn, source_id, &folder.name)?
+        else {
+            continue;
+        };
+        let wire_name = encode_mailbox_name_with(&folder.name, client.utf8_accept());
+        let resp = match control_run_collect(client, control_ctx, &command::getacl(&wire_name)) {
+            Ok(r) => r,
+            Err(e) => {
+                log_at(
+                    logger,
+                    LEVEL_DEFAULT,
+                    &format!("folder {:?}: GETACL failed: {e}", folder.name),
+                );
+                counts.failed += 1;
+                continue;
+            }
+        };
+        let entries = resp
+            .untagged
+            .into_iter()
+            .find_map(|u| match u {
+                Untagged::Acl { entries, .. } => Some(entries),
+                _ => None,
+            })
+            .unwrap_or_default();
+        match db::acls::replace_for_mailbox(conn, mailbox_local, &entries) {
+            Ok(()) => counts.updated += 1,
+            Err(e) => {
+                log_at(
+                    logger,
+                    LEVEL_DEFAULT,
+                    &format!("folder {:?}: ACL store failed: {e}", folder.name),
+                );
+                counts.failed += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

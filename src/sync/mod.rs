@@ -70,6 +70,7 @@ pub struct ExportConfig {
     pub objects: Option<Vec<ObjectType>>,
     pub prune: bool,
     pub yes: bool,
+    pub acl: bool,
 }
 
 #[derive(Debug, Default, Clone)]

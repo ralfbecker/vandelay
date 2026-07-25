@@ -241,6 +241,7 @@ fn export_cfg(localpart: &str, account_id: &str, prune: bool) -> ExportConfig {
         objects: None,
         prune,
         yes: true,
+        acl: false,
     }
 }
 
