@@ -85,7 +85,14 @@ struct GlobalArgs {
         short = 'j',
         long,
         value_name = "N",
-        help = "Worker pool size (default: logical CPUs)"
+        help = "Worker pool size (default: logical CPUs)",
+        long_help = "Worker pool size (default: logical CPUs).\n\
+            Concurrent JMAP requests are additionally capped by the target \
+            server's session limits, so values beyond what the server \
+            advertises have no effect. Email export is bound by \
+            maxConcurrentRequests alone when the target supports \
+            urn:ietf:params:jmap:blob, and by the smaller of \
+            maxConcurrentRequests and maxConcurrentUpload otherwise."
     )]
     threads: Option<usize>,
 
@@ -138,6 +145,16 @@ struct GlobalArgs {
             else touches them."
     )]
     repair_text_hash: bool,
+
+    #[arg(
+        long,
+        help = "Show a live progress line per object type on stderr",
+        long_help = "Show a live progress line per object type on stderr.\n\
+            Reports processed/total, percentage, rate and ETA. When stderr is \
+            not a terminal the line is emitted every few seconds instead of \
+            being redrawn in place."
+    )]
+    progress: bool,
 }
 
 #[derive(Args)]
@@ -1269,6 +1286,7 @@ fn resolve_graph_auth(
 }
 
 fn common_config(global: &GlobalArgs, archive: PathBuf) -> Result<CommonConfig, Error> {
+    init_progress(global);
     if global.repair_text_hash {
         let conn = crate::db::init::open(&archive)?;
         crate::db::blobs::repair_stale_hashes(&conn)?;
@@ -1286,6 +1304,12 @@ fn common_config(global: &GlobalArgs, archive: PathBuf) -> Result<CommonConfig, 
         allow_invalid_certs: global.allow_invalid_certs,
         logger: Logger::from_flags(global.quiet, global.verbose),
     })
+}
+
+fn init_progress(global: &GlobalArgs) {
+    // A redrawn line and per-call protocol tracing fight over stderr, so the
+    // progress line stands down whenever verbose output is on.
+    crate::progress::init(global.progress && !global.quiet && global.verbose == 0);
 }
 
 fn resolve_auth(

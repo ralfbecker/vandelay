@@ -121,13 +121,14 @@ All actions accept a set of global flags (verbosity, worker pool size, retry pol
 
 | Flag | Purpose |
 | --- | --- |
-| `-j, --threads <N>` | Worker pool size (default: logical CPUs). |
+| `-j, --threads <N>` | Worker pool size (default: logical CPUs). Concurrent JMAP requests are additionally capped by the target server's `maxConcurrentRequests` / `maxConcurrentUpload` session limits, so raising this beyond what the server advertises has no effect. |
 | `--dry-run` | Compute the full plan; perform no writes. |
 | `-v`, `-vv`, `-vvv` | Increase log verbosity. |
 | `-q, --quiet` | Warnings and errors only. |
 | `--max-retries <N>` | Max retries per request on transient failures (default 5). |
 | `--allow-invalid-certs` | Accept self-signed / invalid TLS certs. |
 | `--repair-text-hash` | Re-hash blobs hand-edited outside vandelay (e.g. a raw SQL `UPDATE` against the archive) before syncing. Off by default. |
+| `--progress` | Show a live progress line per object type on stderr: processed/total, percentage, rate and ETA. Redrawn in place on a terminal; emitted every few seconds otherwise. |
 
 Credentials should be supplied via the `VANDELAY_PASSWORD` / `VANDELAY_TOKEN` / `VANDELAY_EWS_CLIENT_SECRET` / `VANDELAY_GRAPH_TOKEN` environment variables, or via an interactive prompt; passing them on the command line is supported but not recommended.
 

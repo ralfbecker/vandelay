@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use super::common::{create_batch, target_get_all};
+use super::common::{chunk_size, create_batch, target_get_all};
 use super::{Maps, Net, Plan};
 use crate::error::Error;
 use crate::logging::Logger;
@@ -40,19 +40,22 @@ fn run(
     for (local, key, wire) in local_rows {
         if target_keys.contains(&key) || !seen.insert(key) {
             counts.skipped += 1;
+            crate::progress::advance(1);
             continue;
         }
         batch.push((format!("c{local}"), wire));
     }
-    if !batch.is_empty() {
-        let outcome = create_batch(net, ty, batch).map_err(Error::from)?;
+    for chunk in batch.chunks(chunk_size(&net.limits)) {
+        let outcome = create_batch(net, ty, chunk.to_vec()).map_err(Error::from)?;
         counts.created += outcome.created.len() as u64;
+        crate::progress::advance(outcome.created.len() as u64);
         for (cid, err) in &outcome.not_created {
             logger.warn(&format!(
                 "{} {cid} not created (expected for non-owned addresses): {err}",
                 ty.jmap_name()
             ));
             counts.skipped += 1;
+            crate::progress::advance(1);
         }
     }
     Ok(Plan::default())

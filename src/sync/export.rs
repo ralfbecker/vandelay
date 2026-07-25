@@ -101,10 +101,6 @@ impl<'a> Uploader<'a> {
         self.cache.remove(&local_id);
     }
 
-    fn blob_len(&self, local_id: i64) -> Option<u64> {
-        db::blobs::blob_len(self.conn, local_id).ok().flatten()
-    }
-
     fn take_touched(&mut self) -> Vec<i64> {
         std::mem::take(&mut self.touched)
     }
@@ -124,6 +120,15 @@ struct Net {
     limits: Limits,
     session: Session,
     dry_run: bool,
+}
+
+fn count_rows(conn: &Connection, ty: ObjectType) -> Option<u64> {
+    let table = crate::sync::table_name(ty);
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .ok()
+    .map(|n| n as u64)
 }
 
 fn has_rows(conn: &Connection, ty: ObjectType) -> bool {
@@ -161,6 +166,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
             eprintln!("export: {} ...", ty.jmap_name());
         }
         let mut counts = TypeCounts::default();
+        crate::progress::start(ty.jmap_name(), count_rows(&ctx.conn, *ty));
         let res = reconcile_type(
             &ctx,
             &net,
@@ -178,6 +184,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
                 Plan::default()
             }
         };
+        crate::progress::finish();
         plans.insert(*ty, plan);
         counts_per_type.insert(*ty, counts);
     }
@@ -437,6 +444,8 @@ mod uidtype;
 
 mod email;
 
+mod email_batch;
+
 mod common {
     use super::*;
 
@@ -473,6 +482,15 @@ mod common {
 
     pub fn jid(v: &Value) -> Option<String> {
         v.get("id").and_then(Value::as_str).map(str::to_owned)
+    }
+
+    /// Upper bound on objects per `/set` create batch, so a single network
+    /// round trip cannot take long enough to stall progress reporting for the
+    /// whole phase.
+    const MAX_CREATE_CHUNK: usize = 100;
+
+    pub fn chunk_size(limits: &Limits) -> usize {
+        MAX_CREATE_CHUNK.min(limits.max_objects_in_set.max(1) as usize)
     }
 
     pub fn create_batch(
