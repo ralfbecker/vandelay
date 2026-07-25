@@ -182,6 +182,12 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         counts_per_type.insert(*ty, counts);
     }
 
+    let acl_counts = if config.acl {
+        Some(acl::export(&ctx, &net, &maps, &logger))
+    } else {
+        None
+    };
+
     if config.prune {
         prune_phase(
             &ctx,
@@ -198,6 +204,9 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         if let Some(counts) = counts_per_type.remove(ty) {
             summary.per_type.push((ty.jmap_name(), counts));
         }
+    }
+    if let Some(counts) = acl_counts {
+        summary.per_type.push(("mailbox_acl", counts));
     }
 
     if ctx.dry_run() {
@@ -424,6 +433,8 @@ fn print_dry_run(rows: &[(&'static str, u64, u64, u64)], prune: bool) {
         }
     }
 }
+
+mod acl;
 
 mod tree;
 

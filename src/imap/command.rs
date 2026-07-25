@@ -204,6 +204,10 @@ pub fn status(mailbox: &str, items: &[&str]) -> String {
     out
 }
 
+pub fn getacl(mailbox: &str) -> String {
+    format!("GETACL {}", quote_astring(mailbox))
+}
+
 pub fn uid_search_esearch_all() -> &'static str {
     "UID SEARCH RETURN (ALL) ALL"
 }
@@ -332,6 +336,12 @@ mod tests {
     fn status_items_serialise_in_order() {
         let s = status("INBOX", &["UIDVALIDITY", "UIDNEXT", "MESSAGES"]);
         assert_eq!(s, "STATUS \"INBOX\" (UIDVALIDITY UIDNEXT MESSAGES)");
+    }
+
+    #[test]
+    fn getacl_quotes_mailbox_name() {
+        assert_eq!(getacl("INBOX"), "GETACL \"INBOX\"");
+        assert_eq!(getacl("Shared/Team"), "GETACL \"Shared/Team\"");
     }
 
     #[test]

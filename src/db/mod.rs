@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+pub mod acls;
 pub mod blobs;
 pub mod dav_ids;
 pub mod exchange_ews_ids;

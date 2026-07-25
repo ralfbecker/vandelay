@@ -394,6 +394,7 @@ fn managesieve_round_trip_via_jmap_export_converges() {
         objects: Some(vec![vandelay::types::ObjectType::SieveScript]),
         prune: false,
         yes: false,
+        acl: false,
     };
     let first = sync::export::run(export_common, export_cfg).expect("first export");
     assert!(!first.any_failed(), "first export had failures: {first:?}");
@@ -428,6 +429,7 @@ fn managesieve_round_trip_via_jmap_export_converges() {
         objects: Some(vec![vandelay::types::ObjectType::SieveScript]),
         prune: false,
         yes: false,
+        acl: false,
     };
     let second = sync::export::run(export_common2, export_cfg2).expect("second export");
     for (name, counts) in &second.per_type {

@@ -84,6 +84,7 @@ fn export_cfg(base_url: &str, domain: &str, localpart: &str, account_id: &str) -
         objects: None,
         prune: false,
         yes: true,
+        acl: false,
     }
 }
 

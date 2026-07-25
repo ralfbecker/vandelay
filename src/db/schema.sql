@@ -138,6 +138,19 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     UNIQUE (parent_id, name)
 );
 
+-- Raw RFC 4314 IMAP ACL entries captured by `import imap --acl`, one row per
+-- (mailbox, identifier). `identifier` keeps any RFC 4314 negative-rights `-`
+-- prefix verbatim (e.g. "-anyone"). `rights` is the raw rights character
+-- string as returned by GETACL (e.g. "lrswikta"); translation into a JMAP
+-- rights model happens at export time, not here. Always replaced wholesale
+-- per mailbox on reimport, since GETACL returns the complete current ACL.
+CREATE TABLE IF NOT EXISTS mailbox_acls (
+    mailbox_id  INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+    identifier  TEXT    NOT NULL,
+    rights      TEXT    NOT NULL,
+    PRIMARY KEY (mailbox_id, identifier)
+);
+
 CREATE TABLE IF NOT EXISTS emails (
     id           INTEGER PRIMARY KEY,
     blob_id      INTEGER NOT NULL REFERENCES blobs(id),
