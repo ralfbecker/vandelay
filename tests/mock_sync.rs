@@ -582,11 +582,20 @@ fn email_export_sends_one_email_per_import_call() {
     let imports = server
         .mock("POST", api)
         .match_body(Matcher::Regex("Email/import".into()))
-        .with_body(
+        .with_body_from_request(|req| {
+            let v: Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let cid = v["methodCalls"][0][1]["emails"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
             json!({"methodResponses":[["Email/import",
-                {"accountId":"w","created":{"e":{"id":"x","blobId":"b","threadId":"t","size":10}}},"i"]]})
-            .to_string(),
-        )
+                {"accountId":"w","created":{cid:{"id":"x","blobId":"b","threadId":"t","size":10}}},"i"]]})
+            .to_string()
+            .into_bytes()
+        })
         .expect(2)
         .create();
 

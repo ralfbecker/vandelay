@@ -84,6 +84,22 @@ struct ImportResult {
 
 type BlobCache = Mutex<HashMap<i64, JmapId>>;
 
+fn load_local(ctx: &Context) -> Result<Vec<(i64, EmailRow)>, Error> {
+    let mut stmt = ctx
+        .conn
+        .prepare(EMAIL_SELECT)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
+        Ok((id, row_to_email(row)))
+    })
+    .and_then(|m| m.collect::<Result<Vec<_>, _>>())
+    .map_err(|e| Error::Partial(e.to_string()))?
+    .into_iter()
+    .map(|(id, r)| Ok((id, r.map_err(Error::from)?)))
+    .collect::<Result<_, Error>>()
+}
+
 pub fn reconcile(
     ctx: &Context,
     net: &Net,
@@ -92,6 +108,22 @@ pub fn reconcile(
     logger: &Logger,
 ) -> Result<Plan, Error> {
     let ty = ObjectType::Email;
+    let local = load_local(ctx)?;
+
+    let target_row = db::export_ids::ensure_target(&ctx.conn, &net.api, &net.account)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    let cached = db::export_ids::all_for_type(&ctx.conn, target_row, ty)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+
+    if !local.is_empty() && local.iter().all(|(id, _)| cached.contains_key(id)) {
+        match try_cached(net, &local, &cached, ctx.common.threads, counts)? {
+            Some(plan) => return Ok(plan),
+            None => logger.warn(
+                "Email: cached target ids are stale (target changed since last export); \
+                 rebuilding the full match instead of trusting the cache",
+            ),
+        }
+    }
 
     let target_min = target_query_get(net, ty, Some(&["messageId"]), ctx.common.threads)
         .map_err(Error::from)?;
@@ -122,23 +154,13 @@ pub fn reconcile(
             }
         }
     }
-    let target_keys: HashSet<EmailKey> = email_keys(&indices).into_iter().collect();
-
-    let local: Vec<(i64, EmailRow)> = {
-        let mut stmt = ctx
-            .conn
-            .prepare(EMAIL_SELECT)
-            .map_err(|e| Error::Partial(e.to_string()))?;
-        stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            Ok((id, row_to_email(row)))
-        })
-        .and_then(|m| m.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| Error::Partial(e.to_string()))?
-        .into_iter()
-        .map(|(id, r)| Ok((id, r.map_err(Error::from)?)))
-        .collect::<Result<_, Error>>()?
-    };
+    // A HashMap instead of a bare HashSet of keys, so a local-key match can
+    // recover which target id it matched and cache it for the next run.
+    let target_map: HashMap<EmailKey, String> = target_min
+        .iter()
+        .zip(email_keys(&indices))
+        .filter_map(|(v, key)| jid(v).map(|id| (key, id)))
+        .collect();
 
     let local_indices: Vec<EmailIndex> = local
         .iter()
@@ -153,7 +175,7 @@ pub fn reconcile(
     let (batch_count, batch_bytes) = if batched {
         let pending = local_keys
             .iter()
-            .filter(|k| !target_keys.contains(*k))
+            .filter(|k| !target_map.contains_key(*k))
             .count();
         email_batch::batch_limits(&net.limits, pending, workers)
     } else {
@@ -169,11 +191,13 @@ pub fn reconcile(
     let mut in_flight = 0usize;
     let mut batch: Vec<ImportJob> = Vec::new();
     let mut batch_encoded = 0usize;
+    let mut to_cache: Vec<(i64, String)> = Vec::new();
 
     for (i, key) in local_keys.iter().enumerate() {
-        if target_keys.contains(key) {
+        if let Some(target_jmap_id) = target_map.get(key) {
             counts.skipped += 1;
             crate::progress::advance(1);
+            to_cache.push((local[i].0, target_jmap_id.clone()));
             continue;
         }
         let (local_id, row) = &local[i];
@@ -200,6 +224,7 @@ pub fn reconcile(
                 window,
                 counts,
                 logger,
+                &mut to_cache,
             );
         }
     }
@@ -211,20 +236,55 @@ pub fn reconcile(
         window,
         counts,
         logger,
+        &mut to_cache,
     );
     for batch in pool.finish() {
         for res in batch {
-            account(res, counts, logger);
+            account(res, counts, logger, &mut to_cache);
         }
     }
 
+    if !net.dry_run {
+        db::export_ids::upsert_many(&ctx.conn, target_row, ty, &to_cache)
+            .map_err(|e| Error::Partial(e.to_string()))?;
+    }
+
     Ok(Plan::default())
+}
+
+/// Verifies every cached target id is still present, via a batched existence
+/// check bounded by the number of *local* rows rather than the target's
+/// whole size. Returns `Ok(None)` if any cached id turns out stale, so the
+/// caller falls back to the full rebuild rather than silently trusting a
+/// cache that may no longer reflect the target's real state.
+fn try_cached(
+    net: &Net,
+    local: &[(i64, EmailRow)],
+    cached: &HashMap<i64, String>,
+    threads: usize,
+    counts: &mut TypeCounts,
+) -> Result<Option<Plan>, Error> {
+    let ids: Vec<JmapId> = local
+        .iter()
+        .map(|(local_id, _)| JmapId(cached[local_id].clone()))
+        .collect();
+    let found = get_objects_parallel(net, ObjectType::Email, &ids, Some(&[]), threads)
+        .map_err(Error::from)?;
+    if found.len() != ids.len() {
+        return Ok(None);
+    }
+    for _ in local {
+        counts.skipped += 1;
+        crate::progress::advance(1);
+    }
+    Ok(Some(Plan::default()))
 }
 
 type BatchPool = Pool<Vec<ImportJob>, Vec<ImportResult>>;
 
 /// Hands the accumulated batch to the pool, then drains one completed batch
 /// once the submission window is full so memory stays bounded.
+#[allow(clippy::too_many_arguments)]
 fn submit_batch(
     pool: &BatchPool,
     batch: &mut Vec<ImportJob>,
@@ -233,6 +293,7 @@ fn submit_batch(
     window: usize,
     counts: &mut TypeCounts,
     logger: &Logger,
+    to_cache: &mut Vec<(i64, String)>,
 ) {
     if batch.is_empty() {
         return;
@@ -245,7 +306,7 @@ fn submit_batch(
     {
         *in_flight -= 1;
         for res in done {
-            account(res, counts, logger);
+            account(res, counts, logger, to_cache);
         }
     }
 }
@@ -491,10 +552,21 @@ fn invalidate(cache: &BlobCache, local_id: i64, stale: &JmapId) {
     }
 }
 
-fn account(res: ImportResult, counts: &mut TypeCounts, logger: &Logger) {
+fn account(
+    res: ImportResult,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+    to_cache: &mut Vec<(i64, String)>,
+) {
     crate::progress::advance(1);
     match res.outcome {
-        Ok(SingleImport::Created) => counts.created += 1,
+        Ok(SingleImport::Created(jmap_id)) => {
+            counts.created += 1;
+            if let Some(local_id) = res.cid.strip_prefix('e').and_then(|s| s.parse::<i64>().ok())
+            {
+                to_cache.push((local_id, jmap_id));
+            }
+        }
         Ok(SingleImport::Skipped) => counts.skipped += 1,
         Ok(SingleImport::NotCreated { detail, .. }) => {
             logger.warn(&format!(
@@ -572,7 +644,7 @@ fn import_item(
 
 #[derive(Clone)]
 enum SingleImport {
-    Created,
+    Created(String),
     Skipped,
     NotCreated { error_type: String, detail: String },
 }
@@ -599,8 +671,12 @@ fn send_batch_import(
 
     let mut out = HashMap::with_capacity(cids.len());
     for cid in cids {
-        if created.is_some_and(|c| c.contains_key(&cid)) {
-            out.insert(cid, SingleImport::Created);
+        if let Some(id) = created
+            .and_then(|c| c.get(&cid))
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_str)
+        {
+            out.insert(cid, SingleImport::Created(id.to_owned()));
             continue;
         }
         let err = not_created.and_then(|nc| nc.get(&cid));
@@ -657,13 +733,15 @@ fn send_single_import(net: &Net, cid: &str, item: Value) -> Result<SingleImport,
             detail: err.to_string(),
         });
     }
-    if mr
+    if let Some(id) = mr
         .args
         .get("created")
         .and_then(Value::as_object)
-        .is_some_and(|c| !c.is_empty())
+        .and_then(|c| c.get(cid))
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
     {
-        return Ok(SingleImport::Created);
+        return Ok(SingleImport::Created(id.to_owned()));
     }
     Ok(SingleImport::NotCreated {
         error_type: String::new(),
