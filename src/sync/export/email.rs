@@ -9,13 +9,13 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
 
-use super::common::{jid, target_query_get};
+use super::common::{get_objects_parallel, jid, target_query_get};
 use super::{Maps, Net, Plan, email_batch};
 use crate::db;
 use crate::error::Error;
 use crate::jmap::blobxfer;
 use crate::jmap::error::JmapError;
-use crate::jmap::request::{Request, check_method_error, get_objects};
+use crate::jmap::request::{Request, check_method_error};
 use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
@@ -93,7 +93,8 @@ pub fn reconcile(
 ) -> Result<Plan, Error> {
     let ty = ObjectType::Email;
 
-    let target_min = target_query_get(net, ty, Some(&["messageId"])).map_err(Error::from)?;
+    let target_min = target_query_get(net, ty, Some(&["messageId"]), ctx.common.threads)
+        .map_err(Error::from)?;
     let mut indices: Vec<EmailIndex> = target_min.iter().map(server_index).collect();
 
     let fallback_ids: Vec<JmapId> = target_min
@@ -103,18 +104,15 @@ pub fn reconcile(
         .filter_map(|(v, _)| jid(v).map(JmapId))
         .collect();
     if !fallback_ids.is_empty() {
-        let got = get_objects::<Value>(
-            &net.client,
-            &net.api,
-            &net.account,
-            ty.jmap_name(),
+        let got = get_objects_parallel(
+            net,
+            ty,
             &fallback_ids,
             Some(&["messageId", "from", "subject", "sentAt", "to"]),
-            &net.limits,
+            ctx.common.threads,
         )
         .map_err(Error::from)?;
         let by_id: HashMap<String, &Value> = got
-            .list
             .iter()
             .filter_map(|v| jid(v).map(|i| (i, v)))
             .collect();

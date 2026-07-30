@@ -42,7 +42,7 @@ pub fn reconcile(
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<Plan, Error> {
-    let targets = target_query_get(net, ty, None).map_err(Error::from)?;
+    let targets = target_query_get(net, ty, None, ctx.common.threads).map_err(Error::from)?;
     let mut by_uid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for t in &targets {
         if let (Some(uid), Some(id)) = (target_uid(t), jid(t)) {

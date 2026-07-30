@@ -58,9 +58,9 @@ fn load_local(ctx: &Context, ty: ObjectType) -> Result<Vec<LocalNode>, Error> {
     Ok(rows)
 }
 
-fn load_target(net: &Net, ty: ObjectType) -> Result<Vec<TargetNode>, Error> {
+fn load_target(net: &Net, ty: ObjectType, threads: usize) -> Result<Vec<TargetNode>, Error> {
     let props: &[&str] = &["role", "name", "parentId", "myRights"];
-    let list = target_query_get(net, ty, Some(props)).map_err(Error::from)?;
+    let list = target_query_get(net, ty, Some(props), threads).map_err(Error::from)?;
     Ok(list
         .iter()
         .filter_map(|v| {
@@ -140,7 +140,7 @@ pub fn reconcile(
     logger: &Logger,
 ) -> Result<Plan, Error> {
     let locals = load_local(ctx, ty)?;
-    let targets = load_target(net, ty)?;
+    let targets = load_target(net, ty, ctx.common.threads)?;
 
     let mut matched: HashMap<i64, String> = HashMap::new();
     let mut tmatched: HashSet<String> = HashSet::new();
