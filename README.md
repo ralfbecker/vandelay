@@ -273,12 +273,15 @@ vandelay export \
   (--auth-basic <USER> [--auth-password <PASS>] | --auth-bearer [TOKEN]) \
   (--account-id <ID> | --account-name <NAME>) \
   [--objects <list>] [--prune [--yes]] \
+  [--assume-not-deleted-in-destination] \
   <ARCHIVE>
 ```
 
 Stateless re-export of `ARCHIVE` into a target JMAP server account. The default behaviour is upsert-only: matched items are updated, unmatched local items are created, but pre-existing target items not covered by the archive are left alone.
 
 `--prune` enables destructive reconciliation: target objects that do not match anything in the archive are deleted. The confirmation prompt can be skipped with `--yes` for automation. Export speaks JMAP only; no other target protocols are currently supported.
+
+On a rerun where every local email already has a cached target id from a previous export, vandelay normally re-verifies each cached id still exists on the target before trusting it — a network round trip proportional to mailbox size. `--assume-not-deleted-in-destination` skips that verification and trusts the cache outright, which is much faster on large, unchanged mailboxes but will not notice an email that was deleted on the target out-of-band (e.g. by an end user). Independently of this flag, an email that was deleted at the *source* since the last export (and thus dropped from the archive on the next import) is always detected via a local cache diff and offered for deletion on the target through the normal `--prune` flow.
 
 ### Inspect
 
