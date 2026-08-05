@@ -21,6 +21,7 @@ use crate::jmap::session::{Limits, Session};
 use crate::jmap::wire::JmapId;
 use crate::logging::{LEVEL_DEFAULT, Logger};
 use crate::sync::import_jmap::mapping::{BlobUpload, TargetResolver};
+use crate::sync::pool::{Pool, effective_workers};
 use crate::sync::{CommonConfig, Context, ExportConfig, Summary, TypeCounts};
 use crate::types::ObjectType;
 
@@ -464,6 +465,7 @@ mod common {
         net: &Net,
         ty: ObjectType,
         props: Option<&[&str]>,
+        threads: usize,
     ) -> Result<Vec<Value>, JmapError> {
         let ids = query_all_ids(
             &net.client,
@@ -475,16 +477,78 @@ mod common {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let got = get_objects::<Value>(
-            &net.client,
-            &net.api,
-            &net.account,
-            ty.jmap_name(),
-            &ids,
-            props,
-            &net.limits,
-        )?;
-        Ok(got.list)
+        get_objects_parallel(net, ty, &ids, props, threads)
+    }
+
+    /// Fetches `ids` in parallel chunks bounded by the server's advertised
+    /// concurrency limit. Each chunk is an independent `Type/get` request
+    /// with no ordering dependency on the others, unlike the anchor-based
+    /// `Type/query` pagination used to list `ids` in the first place, which
+    /// must stay sequential (each page's request needs the previous page's
+    /// anchor). For a target with hundreds of thousands of objects already
+    /// on it, this fetch — not the creation loop that follows — is the part
+    /// that dominates wall-clock time, and it previously ran one request at
+    /// a time regardless of `--threads`.
+    pub fn get_objects_parallel(
+        net: &Net,
+        ty: ObjectType,
+        ids: &[JmapId],
+        props: Option<&[&str]>,
+        threads: usize,
+    ) -> Result<Vec<Value>, JmapError> {
+        let chunk = net.limits.max_objects_in_get.max(1) as usize;
+        let workers = effective_workers(threads, &net.limits, false);
+        if workers <= 1 || ids.len() <= chunk {
+            return Ok(get_objects::<Value>(
+                &net.client,
+                &net.api,
+                &net.account,
+                ty.jmap_name(),
+                ids,
+                props,
+                &net.limits,
+            )?
+            .list);
+        }
+
+        let type_name = ty.jmap_name();
+        let owned_props: Option<Vec<String>> =
+            props.map(|p| p.iter().map(|s| (*s).to_owned()).collect());
+        let pool: Pool<Vec<JmapId>, Result<Vec<Value>, JmapError>> = Pool::new(workers, {
+            let net = net.clone();
+            move |group: Vec<JmapId>| {
+                let props: Option<Vec<&str>> = owned_props
+                    .as_ref()
+                    .map(|v| v.iter().map(String::as_str).collect());
+                get_objects::<Value>(
+                    &net.client,
+                    &net.api,
+                    &net.account,
+                    type_name,
+                    &group,
+                    props.as_deref(),
+                    &net.limits,
+                )
+                .map(|r| r.list)
+            }
+        });
+        for group in ids.chunks(chunk) {
+            pool.submit(group.to_vec());
+        }
+
+        let mut out = Vec::with_capacity(ids.len());
+        let mut first_err = None;
+        for res in pool.finish() {
+            match res {
+                Ok(list) => out.extend(list),
+                Err(e) if first_err.is_none() => first_err = Some(e),
+                Err(_) => {}
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(out)
     }
 
     pub fn target_get_all(net: &Net, ty: ObjectType) -> Result<Vec<Value>, JmapError> {
@@ -573,3 +637,4 @@ mod common {
         outcome
     }
 }
+

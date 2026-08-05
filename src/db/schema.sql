@@ -35,6 +35,27 @@ CREATE TABLE IF NOT EXISTS sync_state_jmap (
     PRIMARY KEY (source_id, type_name)
 );
 
+-- One archive can be exported to more than one target over its lifetime, so
+-- the id cache below is scoped per target rather than assumed singular.
+CREATE TABLE IF NOT EXISTS export_targets (
+    id            INTEGER PRIMARY KEY,
+    session_url   TEXT    NOT NULL,
+    account_id    TEXT    NOT NULL,
+    UNIQUE (session_url, account_id)
+);
+
+-- Caches the target JMAP id vandelay last confirmed for a local row, so a
+-- rerun can verify a small set of known ids instead of rebuilding the whole
+-- target-side dedup index from scratch. Never trusted blindly: a rerun
+-- verifies each cached id is still on the target before relying on it.
+CREATE TABLE IF NOT EXISTS export_target_ids (
+    target_id   INTEGER NOT NULL REFERENCES export_targets(id) ON DELETE CASCADE,
+    type_name   TEXT    NOT NULL,
+    local_id    INTEGER NOT NULL,
+    jmap_id     TEXT    NOT NULL,
+    PRIMARY KEY (target_id, type_name, local_id)
+);
+
 CREATE TABLE IF NOT EXISTS sync_id_imap (
     source_id    INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     type_name    TEXT    NOT NULL CHECK (type_name IN ('mailbox','email')),
