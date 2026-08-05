@@ -106,6 +106,34 @@ pub fn delete_many(
     tx.commit()
 }
 
+/// The target's Email `state` token as of the end of the last export that
+/// completed cleanly, or `None` if there isn't one (never exported before,
+/// or the last attempt didn't finish cleanly — see [`set_email_state`]).
+pub fn get_email_state(conn: &Connection, target_id: i64) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT email_state FROM export_targets WHERE id = ?1",
+        params![target_id],
+        |row| row.get(0),
+    )
+}
+
+/// Sets (or, with `None`, clears) the target's persisted Email state token.
+/// Callers clear it the instant they decide to rely on a match, before
+/// doing anything else, and only set a fresh token once the run that relied
+/// on it finishes cleanly — so a run that crashes in between leaves `NULL`
+/// rather than a token whose validity can no longer be vouched for.
+pub fn set_email_state(
+    conn: &Connection,
+    target_id: i64,
+    state: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE export_targets SET email_state = ?1 WHERE id = ?2",
+        params![state, target_id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +220,32 @@ mod tests {
         upsert(&c, t, ObjectType::Email, 1, "e1").unwrap();
         delete_many(&c, t, ObjectType::Email, &[]).unwrap();
         assert_eq!(all_for_type(&c, t, ObjectType::Email).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn email_state_defaults_to_none_and_roundtrips() {
+        let c = mem();
+        let t = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        assert_eq!(get_email_state(&c, t).unwrap(), None);
+
+        set_email_state(&c, t, Some("s1")).unwrap();
+        assert_eq!(get_email_state(&c, t).unwrap(), Some("s1".to_owned()));
+
+        set_email_state(&c, t, Some("s2")).unwrap();
+        assert_eq!(get_email_state(&c, t).unwrap(), Some("s2".to_owned()));
+
+        set_email_state(&c, t, None).unwrap();
+        assert_eq!(get_email_state(&c, t).unwrap(), None);
+    }
+
+    #[test]
+    fn email_state_is_scoped_per_target() {
+        let c = mem();
+        let a = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        let b = ensure_target(&c, "https://b/jmap", "w").unwrap();
+        set_email_state(&c, a, Some("only-a")).unwrap();
+        assert_eq!(get_email_state(&c, a).unwrap(), Some("only-a".to_owned()));
+        assert_eq!(get_email_state(&c, b).unwrap(), None);
     }
 
     #[test]

@@ -388,10 +388,15 @@ struct ExportArgs {
 
     #[arg(
         long,
-        help = "Skip verifying that previously-exported emails still exist on the target \
-                before trusting the id cache on a rerun (faster on large mailboxes, at the \
-                cost of not detecting emails removed on the target out-of-band); combine with \
-                --prune to still remove emails deleted at the source since the last export"
+        help = "Manual override for when the automatic (server-verified, always-on) fast path \
+                doesn't apply, e.g. the target is independently receiving mail: unconditionally \
+                trusts the local id cache instead of verifying against the target, and creates \
+                not-yet-cached emails directly with no target-side dedup search. Much faster on \
+                large or actively growing mailboxes, but unlike the automatic fast path this is \
+                an unverified assertion: a message created by a run that crashed before caching \
+                its id would be recreated as a duplicate here (mitigated, not eliminated, by id \
+                cache writes happening incrementally during the run); combine with --prune to \
+                still remove emails deleted at the source"
     )]
     assume_not_deleted_in_destination: bool,
 

@@ -1128,13 +1128,32 @@ fn export_email_assume_not_deleted_skips_existence_verification() {
         .with_body(session_body(&base))
         .create();
 
-    // No existence check should fire at all: the fast path must not touch
-    // the target for anything Email-related.
-    let get_calls = server
+    // No dedup query or per-id existence check should fire at all: the fast
+    // path must not touch the target to verify anything. The only Email/get
+    // that's expected is the cheap end-of-run state capture (empty ids), so
+    // the target-untouched assertion is scoped to non-empty-ids Email/get
+    // calls and to Email/query specifically.
+    let no_query = server
         .mock("POST", api)
-        .match_body(Matcher::Regex("Email/(get|query)".into()))
+        .match_body(Matcher::Regex("Email/query".into()))
         .with_status(500)
         .expect(0)
+        .create();
+    let no_existence_check = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\"".into()))
+        .with_status(500)
+        .expect(0)
+        .create();
+    let state_capture = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\\]".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",
+                {"accountId":"w","state":"s1","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
         .create();
 
     let summary = sync::export::run(
@@ -1157,7 +1176,9 @@ fn export_email_assume_not_deleted_skips_existence_verification() {
     )
     .expect("export run");
 
-    get_calls.assert();
+    no_query.assert();
+    no_existence_check.assert();
+    state_capture.assert();
     let email = summary
         .per_type
         .iter()
@@ -1167,6 +1188,370 @@ fn export_email_assume_not_deleted_skips_existence_verification() {
     assert_eq!(email.skipped, 3);
     assert_eq!(email.created, 0);
     assert_eq!(email.failed, 0);
+
+    let conn = db::init::open(&archive).unwrap();
+    let target_id =
+        db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+    assert_eq!(
+        db::export_ids::get_email_state(&conn, target_id).unwrap(),
+        Some("s1".to_owned()),
+        "the freshly captured state should be persisted for next run"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_assume_not_deleted_creates_new_rows_without_full_target_fetch() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        // ids 1 and 2 were already exported (cached); id 3 is brand new
+        // (arrived since the last export) and has no cache entry.
+        for n in 1..=3 {
+            let raw = format!("From: a@x\r\nSubject: s{n}\r\nMessage-ID: <m{n}@h>\r\n\r\nbody {n}");
+            let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
+            conn.execute(
+                "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        }
+        let target_id =
+            db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+        db::export_ids::upsert_many(
+            &conn,
+            target_id,
+            ObjectType::Email,
+            &[(1, "x-1".to_owned()), (2, "x-2".to_owned())],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
+
+    // The whole point of the flag: no target-wide Email listing/lookup to
+    // dedup the new row against, and no existence check for the cached
+    // ones. The only Email/get expected is the cheap end-of-run state
+    // capture, which requests no ids at all.
+    let no_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_status(500)
+        .expect(0)
+        .create();
+    let no_existence_check = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\"".into()))
+        .with_status(500)
+        .expect(0)
+        .create();
+    let state_capture = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\\]".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",
+                {"accountId":"w","state":"s1","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let upload = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP3"}).to_string())
+        .expect(1)
+        .create();
+    let import = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",
+                {"accountId":"w","created":{"e3":{"id":"x-3","blobId":"b","threadId":"t","size":10}}},
+                "i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+            acl: false,
+            assume_not_deleted_in_destination: true,
+        },
+    )
+    .expect("export run");
+
+    no_query.assert();
+    no_existence_check.assert();
+    state_capture.assert();
+    upload.assert();
+    import.assert();
+
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.skipped, 2, "the two cached rows are trusted without verification");
+    assert_eq!(email.created, 1, "the new row is created directly, no dedup search");
+    assert_eq!(email.failed, 0);
+
+    // The newly created row's cache entry must already be there (written
+    // incrementally), not only after the whole run finishes.
+    let conn = db::init::open(&archive).unwrap();
+    let target_id =
+        db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+    let cache = db::export_ids::all_for_type(&conn, target_id, ObjectType::Email).unwrap();
+    assert_eq!(cache.len(), 3);
+    assert_eq!(cache.get(&3), Some(&"x-3".to_owned()));
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_matching_target_state_skips_verification_with_no_flag() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        let mut local_ids = Vec::new();
+        for n in 1..=3 {
+            let raw = format!("From: a@x\r\nSubject: s{n}\r\nMessage-ID: <m{n}@h>\r\n\r\nbody {n}");
+            let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
+            conn.execute(
+                "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+            local_ids.push(conn.last_insert_rowid());
+        }
+        let target_id =
+            db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+        let pairs: Vec<(i64, String)> = local_ids
+            .iter()
+            .map(|id| (*id, format!("x-{id}")))
+            .collect();
+        db::export_ids::upsert_many(&conn, target_id, ObjectType::Email, &pairs).unwrap();
+        // The state as of the end of a previous, cleanly-finished export.
+        db::export_ids::set_email_state(&conn, target_id, Some("s1")).unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    // Called twice: once to compare against the persisted token, once more
+    // at the end of the run to capture a fresh one for next time. Neither a
+    // real dedup query nor a real existence check (non-empty ids) may fire.
+    let state_calls = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\\]".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",
+                {"accountId":"w","state":"s1","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let no_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_status(500)
+        .expect(0)
+        .create();
+    let no_existence_check = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\"".into()))
+        .with_status(500)
+        .expect(0)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: Some(vec![ObjectType::Email]),
+            prune: false,
+            yes: true,
+            acl: false,
+            assume_not_deleted_in_destination: false,
+        },
+    )
+    .expect("export run");
+
+    state_calls.assert();
+    no_query.assert();
+    no_existence_check.assert();
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.skipped, 3);
+    assert_eq!(email.created, 0);
+    assert_eq!(email.failed, 0);
+
+    let conn = db::init::open(&archive).unwrap();
+    let target_id =
+        db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+    assert_eq!(
+        db::export_ids::get_email_state(&conn, target_id).unwrap(),
+        Some("s1".to_owned()),
+        "a fresh (here, unchanged) state token should be persisted after a clean finish"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_mismatched_target_state_falls_back_to_verification() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        for n in 1..=2 {
+            let raw = format!("From: a@x\r\nSubject: s{n}\r\nMessage-ID: <m{n}@h>\r\n\r\nbody {n}");
+            let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
+            conn.execute(
+                "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        }
+        let target_id =
+            db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+        db::export_ids::upsert_many(
+            &conn,
+            target_id,
+            ObjectType::Email,
+            &[(1, "x-1".to_owned()), (2, "x-2".to_owned())],
+        )
+        .unwrap();
+        // Stale: the target moved since this was recorded.
+        db::export_ids::set_email_state(&conn, target_id, Some("stale")).unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    // The state check reports "new", which doesn't match "stale", so the
+    // run must fall back to try_cached's real existence check rather than
+    // trusting the cache outright — then still capture a fresh token at the
+    // end so a later run gets a chance at the fast path again.
+    let state_calls = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\\]".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",
+                {"accountId":"w","state":"new","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let existence_check = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\"".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","list":[
+                {"id":"x-1"},{"id":"x-2"}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: Some(vec![ObjectType::Email]),
+            prune: false,
+            yes: true,
+            acl: false,
+            assume_not_deleted_in_destination: false,
+        },
+    )
+    .expect("export run");
+
+    state_calls.assert();
+    existence_check.assert();
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.skipped, 2);
+    assert_eq!(email.created, 0);
+    assert_eq!(email.failed, 0);
+
+    let conn = db::init::open(&archive).unwrap();
+    let target_id =
+        db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+    assert_eq!(
+        db::export_ids::get_email_state(&conn, target_id).unwrap(),
+        Some("new".to_owned()),
+        "the fresh state should still be captured after a successful fallback run"
+    );
+
     let _ = std::fs::remove_file(&archive);
 }
 

@@ -37,10 +37,21 @@ CREATE TABLE IF NOT EXISTS sync_state_jmap (
 
 -- One archive can be exported to more than one target over its lifetime, so
 -- the id cache below is scoped per target rather than assumed singular.
+--
+-- email_state holds the target's JMAP Email `state` token as of the end of
+-- the last export that completed cleanly, letting the next run prove (not
+-- just assume) that nothing changed on the target in between: if the
+-- target's current Email state still matches, every cached id is still
+-- valid and every local row not yet cached provably isn't on the target
+-- either. It is cleared the instant a run decides to rely on it and only
+-- set again once that run finishes cleanly, so a run that crashes after
+-- clearing it leaves NULL behind rather than a token whose validity it can
+-- no longer vouch for.
 CREATE TABLE IF NOT EXISTS export_targets (
     id            INTEGER PRIMARY KEY,
     session_url   TEXT    NOT NULL,
     account_id    TEXT    NOT NULL,
+    email_state   TEXT,
     UNIQUE (session_url, account_id)
 );
 

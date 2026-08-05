@@ -15,7 +15,7 @@ use crate::db;
 use crate::error::Error;
 use crate::jmap::blobxfer;
 use crate::jmap::error::JmapError;
-use crate::jmap::request::{Request, check_method_error};
+use crate::jmap::request::{Request, check_method_error, get_state};
 use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
@@ -122,22 +122,44 @@ pub fn reconcile(
     // confirms the *surviving* cache entries against the target.
     let (prune_candidates, prune_local_ids) = source_deleted(&local, &cached);
 
-    if !local.is_empty() && local.iter().all(|(id, _)| cached.contains_key(id)) {
+    if !local.is_empty() {
+        if let Some(mut plan) = try_state_proven_fast_path(
+            ctx, net, maps, target_row, ty, &local, &cached, counts, logger,
+        )? {
+            plan.prune_candidates = prune_candidates;
+            plan.prune_local_ids = prune_local_ids;
+            return Ok(plan);
+        }
+
         if net.assume_not_deleted_in_destination {
-            for _ in &local {
-                counts.skipped += 1;
-                crate::progress::advance(1);
-            }
+            // Unlike the state-proven path above, this is an unverified
+            // assertion: cached rows are trusted outright and anything
+            // without a cache entry is created directly with no
+            // target-side dedup search at all — unlike the full rebuild
+            // below, whose entire purpose is catching objects the cache
+            // doesn't know about. That's an accepted trade-off: a message
+            // created by a prior run that crashed before its id was cached
+            // would be recreated here as a duplicate. `create_missing`
+            // writes cache rows incrementally (per completed batch, not
+            // once at the very end) specifically to bound how much a crash
+            // mid-run can lose to a handful of in-flight batches rather
+            // than the whole run.
+            trust_cache_and_create(ctx, net, maps, target_row, ty, &local, &cached, counts, logger)?;
+            record_state_for_next_run(ctx, net, target_row, logger);
             return Ok(Plan {
                 prune_candidates,
                 prune_local_ids,
                 ..Plan::default()
             });
         }
+    }
+
+    if !local.is_empty() && local.iter().all(|(id, _)| cached.contains_key(id)) {
         match try_cached(net, &local, &cached, ctx.common.threads, counts)? {
             Some(mut plan) => {
                 plan.prune_candidates = prune_candidates;
                 plan.prune_local_ids = prune_local_ids;
+                record_state_for_next_run(ctx, net, target_row, logger);
                 return Ok(plan);
             }
             None => logger.warn(
@@ -191,16 +213,165 @@ pub fn reconcile(
         .collect();
     let local_keys = email_keys(&local_indices);
 
+    let mut matched_to_cache: Vec<(i64, String)> = Vec::new();
+    let mut to_create: Vec<(i64, &EmailRow)> = Vec::new();
+    for (i, key) in local_keys.iter().enumerate() {
+        if let Some(target_jmap_id) = target_map.get(key) {
+            counts.skipped += 1;
+            crate::progress::advance(1);
+            matched_to_cache.push((local[i].0, target_jmap_id.clone()));
+        } else {
+            to_create.push((local[i].0, &local[i].1));
+        }
+    }
+    create_missing(ctx, net, maps, target_row, ty, &to_create, counts, logger)?;
+
+    if !net.dry_run {
+        db::export_ids::upsert_many(&ctx.conn, target_row, ty, &matched_to_cache)
+            .map_err(|e| Error::Partial(e.to_string()))?;
+    }
+    record_state_for_next_run(ctx, net, target_row, logger);
+
+    Ok(Plan {
+        prune_candidates,
+        prune_local_ids,
+        ..Plan::default()
+    })
+}
+
+/// If the target's Email `state` token hasn't moved since the end of the
+/// last export that finished cleanly, this is provably (not just assumed)
+/// safe: every cached id is still valid, and every local row *not* yet
+/// cached can't be on the target either — it would have had to move the
+/// state to get there. That makes it strictly safer than
+/// `--assume-not-deleted-in-destination`, which asserts the same thing
+/// without proof, so it's tried first and needs no flag.
+///
+/// Returns `Ok(None)` whenever there's no persisted state, it doesn't match
+/// the target's current one, or fetching it fails, so the caller falls
+/// through to its normal (slower but unconditionally safe) strategy.
+#[allow(clippy::too_many_arguments)]
+fn try_state_proven_fast_path(
+    ctx: &Context,
+    net: &Net,
+    maps: &Maps,
+    target_row: i64,
+    ty: ObjectType,
+    local: &[(i64, EmailRow)],
+    cached: &HashMap<i64, String>,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Result<Option<Plan>, Error> {
+    let persisted = db::export_ids::get_email_state(&ctx.conn, target_row)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    let Some(persisted) = persisted else {
+        return Ok(None);
+    };
+    let current = match get_state(&net.client, &net.api, &net.account, "Email") {
+        Ok(s) => s,
+        Err(e) => {
+            logger.warn(&format!(
+                "Email: fetching target state failed, falling back to the default strategy: {e}"
+            ));
+            return Ok(None);
+        }
+    };
+    if current.as_deref() != Some(persisted.as_str()) {
+        return Ok(None);
+    }
+
+    // Proven safe for exactly this run. Clear immediately, before relying on
+    // it for anything, so a crash anywhere below leaves NULL behind: the
+    // next run then correctly falls back to the default strategy instead of
+    // re-trusting a token whose validity this run can no longer vouch for.
+    if !net.dry_run {
+        db::export_ids::set_email_state(&ctx.conn, target_row, None)
+            .map_err(|e| Error::Partial(e.to_string()))?;
+    }
+
+    trust_cache_and_create(ctx, net, maps, target_row, ty, local, cached, counts, logger)?;
+    record_state_for_next_run(ctx, net, target_row, logger);
+
+    Ok(Some(Plan::default()))
+}
+
+/// Captures the target's current Email state and persists it so a future
+/// run's [`try_state_proven_fast_path`] can use it, once this run reaches
+/// this point without error. Best-effort: failing to record it only means
+/// the next run won't get to skip its target checks, not that this run's
+/// own work is lost, so it's logged and swallowed rather than propagated.
+fn record_state_for_next_run(ctx: &Context, net: &Net, target_row: i64, logger: &Logger) {
+    if net.dry_run {
+        return;
+    }
+    match get_state(&net.client, &net.api, &net.account, "Email") {
+        Ok(Some(state)) => {
+            if let Err(e) = db::export_ids::set_email_state(&ctx.conn, target_row, Some(&state)) {
+                logger.warn(&format!("Email: recording target state for next run failed: {e}"));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => logger.warn(&format!(
+            "Email: fetching target state for next run failed: {e}"
+        )),
+    }
+}
+
+/// Trusts every cached row outright and creates everything else directly,
+/// with no target-side dedup search. Shared by the state-proven fast path
+/// (where this is provably safe) and `--assume-not-deleted-in-destination`
+/// (where it's an accepted, documented risk).
+#[allow(clippy::too_many_arguments)]
+fn trust_cache_and_create(
+    ctx: &Context,
+    net: &Net,
+    maps: &Maps,
+    target_row: i64,
+    ty: ObjectType,
+    local: &[(i64, EmailRow)],
+    cached: &HashMap<i64, String>,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Result<(), Error> {
+    let mut to_create: Vec<(i64, &EmailRow)> = Vec::new();
+    for (local_id, row) in local {
+        if cached.contains_key(local_id) {
+            counts.skipped += 1;
+            crate::progress::advance(1);
+        } else {
+            to_create.push((*local_id, row));
+        }
+    }
+    create_missing(ctx, net, maps, target_row, ty, &to_create, counts, logger)
+}
+
+/// Creates every row in `to_create` on the target, batching blob uploads and
+/// `Email/import` calls as usual. Creation results are cached incrementally
+/// (one completed batch at a time, via `submit_batch`/`flush_results`)
+/// rather than accumulated for a single write at the end of the run: for a
+/// reconcile spanning hundreds of thousands of messages, that bounds how
+/// much a crash mid-run can lose to whatever batches were still in flight.
+#[allow(clippy::too_many_arguments)]
+fn create_missing(
+    ctx: &Context,
+    net: &Net,
+    maps: &Maps,
+    target_row: i64,
+    ty: ObjectType,
+    to_create: &[(i64, &EmailRow)],
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Result<(), Error> {
+    if to_create.is_empty() {
+        return Ok(());
+    }
+
     // Servers cap in-flight requests per user, so the cost driver is request
     // count. With RFC 9404 one request carries a whole batch of blobs.
     let batched = email_batch::supports_blob_upload(&net.session);
     let workers = import_workers(ctx.common.threads, &net.limits, batched);
     let (batch_count, batch_bytes) = if batched {
-        let pending = local_keys
-            .iter()
-            .filter(|k| !target_map.contains_key(*k))
-            .count();
-        email_batch::batch_limits(&net.limits, pending, workers)
+        email_batch::batch_limits(&net.limits, to_create.len(), workers)
     } else {
         (1, usize::MAX)
     };
@@ -214,16 +385,8 @@ pub fn reconcile(
     let mut in_flight = 0usize;
     let mut batch: Vec<ImportJob> = Vec::new();
     let mut batch_encoded = 0usize;
-    let mut to_cache: Vec<(i64, String)> = Vec::new();
 
-    for (i, key) in local_keys.iter().enumerate() {
-        if let Some(target_jmap_id) = target_map.get(key) {
-            counts.skipped += 1;
-            crate::progress::advance(1);
-            to_cache.push((local[i].0, target_jmap_id.clone()));
-            continue;
-        }
-        let (local_id, row) = &local[i];
+    for (local_id, row) in to_create {
         let job = match prepare_job(ctx, maps, *local_id, row, counts, logger) {
             Some(j) => j,
             None => {
@@ -240,6 +403,9 @@ pub fn reconcile(
         batch.push(job);
         if batch.len() >= batch_count || batch_encoded >= batch_bytes {
             submit_batch(
+                ctx,
+                target_row,
+                ty,
                 &pool,
                 &mut batch,
                 &mut batch_encoded,
@@ -247,11 +413,13 @@ pub fn reconcile(
                 window,
                 counts,
                 logger,
-                &mut to_cache,
-            );
+            )?;
         }
     }
     submit_batch(
+        ctx,
+        target_row,
+        ty,
         &pool,
         &mut batch,
         &mut batch_encoded,
@@ -259,24 +427,11 @@ pub fn reconcile(
         window,
         counts,
         logger,
-        &mut to_cache,
-    );
+    )?;
     for batch in pool.finish() {
-        for res in batch {
-            account(res, counts, logger, &mut to_cache);
-        }
+        flush_results(ctx, target_row, ty, batch, counts, logger)?;
     }
-
-    if !net.dry_run {
-        db::export_ids::upsert_many(&ctx.conn, target_row, ty, &to_cache)
-            .map_err(|e| Error::Partial(e.to_string()))?;
-    }
-
-    Ok(Plan {
-        prune_candidates,
-        prune_local_ids,
-        ..Plan::default()
-    })
+    Ok(())
 }
 
 /// Cache rows whose local id no longer has a matching row in `local`,
@@ -356,10 +511,14 @@ fn try_cached(
 
 type BatchPool = Pool<Vec<ImportJob>, Vec<ImportResult>>;
 
-/// Hands the accumulated batch to the pool, then drains one completed batch
-/// once the submission window is full so memory stays bounded.
+/// Hands the accumulated batch to the pool, then drains and persists one
+/// completed batch once the submission window is full so memory stays
+/// bounded.
 #[allow(clippy::too_many_arguments)]
 fn submit_batch(
+    ctx: &Context,
+    target_row: i64,
+    ty: ObjectType,
     pool: &BatchPool,
     batch: &mut Vec<ImportJob>,
     encoded: &mut usize,
@@ -367,10 +526,9 @@ fn submit_batch(
     window: usize,
     counts: &mut TypeCounts,
     logger: &Logger,
-    to_cache: &mut Vec<(i64, String)>,
-) {
+) -> Result<(), Error> {
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     pool.submit(std::mem::take(batch));
     *encoded = 0;
@@ -379,10 +537,31 @@ fn submit_batch(
         && let Ok(done) = pool.results().recv()
     {
         *in_flight -= 1;
-        for res in done {
-            account(res, counts, logger, to_cache);
-        }
+        flush_results(ctx, target_row, ty, done, counts, logger)?;
     }
+    Ok(())
+}
+
+/// Accounts one completed batch and immediately persists whatever target ids
+/// it produced, instead of accumulating results for a single write at the
+/// end of a reconcile that may run for hours.
+fn flush_results(
+    ctx: &Context,
+    target_row: i64,
+    ty: ObjectType,
+    done: Vec<ImportResult>,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Result<(), Error> {
+    let mut to_cache = Vec::new();
+    for res in done {
+        account(res, counts, logger, &mut to_cache);
+    }
+    if to_cache.is_empty() {
+        return Ok(());
+    }
+    db::export_ids::upsert_many(&ctx.conn, target_row, ty, &to_cache)
+        .map_err(|e| Error::Partial(e.to_string()))
 }
 
 fn one_result(net: &Net, cache: &BlobCache, job: ImportJob) -> ImportResult {
