@@ -71,6 +71,7 @@ pub struct ExportConfig {
     pub prune: bool,
     pub yes: bool,
     pub acl: bool,
+    pub assume_not_deleted_in_destination: bool,
 }
 
 #[derive(Debug, Default, Clone)]

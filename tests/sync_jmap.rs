@@ -242,6 +242,7 @@ fn export_cfg(localpart: &str, account_id: &str, prune: bool) -> ExportConfig {
         prune,
         yes: true,
         acl: false,
+        assume_not_deleted_in_destination: false,
     }
 }
 

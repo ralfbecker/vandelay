@@ -115,9 +115,31 @@ pub fn reconcile(
     let cached = db::export_ids::all_for_type(&ctx.conn, target_row, ty)
         .map_err(|e| Error::Partial(e.to_string()))?;
 
+    // Import never revives a local id, so any cache row whose local id is no
+    // longer in the archive means that message was deleted at the source
+    // since the last export. Detecting this is a pure local lookup against
+    // our own cache, independent of (and cheaper than) whichever path below
+    // confirms the *surviving* cache entries against the target.
+    let (prune_candidates, prune_local_ids) = source_deleted(&local, &cached);
+
     if !local.is_empty() && local.iter().all(|(id, _)| cached.contains_key(id)) {
+        if net.assume_not_deleted_in_destination {
+            for _ in &local {
+                counts.skipped += 1;
+                crate::progress::advance(1);
+            }
+            return Ok(Plan {
+                prune_candidates,
+                prune_local_ids,
+                ..Plan::default()
+            });
+        }
         match try_cached(net, &local, &cached, ctx.common.threads, counts)? {
-            Some(plan) => return Ok(plan),
+            Some(mut plan) => {
+                plan.prune_candidates = prune_candidates;
+                plan.prune_local_ids = prune_local_ids;
+                return Ok(plan);
+            }
             None => logger.warn(
                 "Email: cached target ids are stale (target changed since last export); \
                  rebuilding the full match instead of trusting the cache",
@@ -250,7 +272,57 @@ pub fn reconcile(
             .map_err(|e| Error::Partial(e.to_string()))?;
     }
 
-    Ok(Plan::default())
+    Ok(Plan {
+        prune_candidates,
+        prune_local_ids,
+        ..Plan::default()
+    })
+}
+
+/// Cache rows whose local id no longer has a matching row in `local`,
+/// returned as parallel `(target jmap ids, local ids)` vectors suitable for
+/// [`Plan::prune_candidates`] / [`Plan::prune_local_ids`].
+fn source_deleted(
+    local: &[(i64, EmailRow)],
+    cached: &HashMap<i64, String>,
+) -> (Vec<String>, Vec<i64>) {
+    let local_ids: HashSet<i64> = local.iter().map(|(id, _)| *id).collect();
+    cached
+        .iter()
+        .filter(|(local_id, _)| !local_ids.contains(local_id))
+        .map(|(local_id, jmap_id)| (jmap_id.clone(), *local_id))
+        .unzip()
+}
+
+/// Drops `export_target_ids` rows for the local ids behind whichever of
+/// `plan.prune_candidates` the target just confirmed as destroyed. Ids the
+/// target reported as not destroyed keep their cache row, so they resurface
+/// as candidates again on the next export instead of being forgotten after
+/// a failed attempt.
+pub fn forget_destroyed(
+    ctx: &Context,
+    net: &Net,
+    plan: &Plan,
+    destroyed: &[String],
+) -> Result<(), Error> {
+    if destroyed.is_empty() || plan.prune_local_ids.is_empty() {
+        return Ok(());
+    }
+    let destroyed: HashSet<&str> = destroyed.iter().map(String::as_str).collect();
+    let local_ids: Vec<i64> = plan
+        .prune_candidates
+        .iter()
+        .zip(&plan.prune_local_ids)
+        .filter(|(jmap_id, _)| destroyed.contains(jmap_id.as_str()))
+        .map(|(_, local_id)| *local_id)
+        .collect();
+    if local_ids.is_empty() {
+        return Ok(());
+    }
+    let target_row = db::export_ids::ensure_target(&ctx.conn, &net.api, &net.account)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    db::export_ids::delete_many(&ctx.conn, target_row, ObjectType::Email, &local_ids)
+        .map_err(|e| Error::Partial(e.to_string()))
 }
 
 /// Verifies every cached target id is still present, via a batched existence

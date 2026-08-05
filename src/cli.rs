@@ -386,6 +386,15 @@ struct ExportArgs {
     )]
     acl: bool,
 
+    #[arg(
+        long,
+        help = "Skip verifying that previously-exported emails still exist on the target \
+                before trusting the id cache on a rerun (faster on large mailboxes, at the \
+                cost of not detecting emails removed on the target out-of-band); combine with \
+                --prune to still remove emails deleted at the source since the last export"
+    )]
+    assume_not_deleted_in_destination: bool,
+
     #[command(flatten)]
     global: GlobalArgs,
 
@@ -924,6 +933,7 @@ fn resolve_export(args: ExportArgs) -> Result<Action, Error> {
             prune: args.prune,
             yes: args.yes,
             acl: args.acl || acl_in_objects,
+            assume_not_deleted_in_destination: args.assume_not_deleted_in_destination,
         },
     ))
 }

@@ -121,6 +121,7 @@ struct Net {
     limits: Limits,
     session: Session,
     dry_run: bool,
+    assume_not_deleted_in_destination: bool,
 }
 
 fn count_rows(conn: &Connection, ty: ObjectType) -> Option<u64> {
@@ -153,6 +154,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         limits: connected.limits,
         session: connected.session.clone(),
         dry_run: ctx.dry_run(),
+        assume_not_deleted_in_destination: config.assume_not_deleted_in_destination,
     };
 
     let work = work_list(&ctx.conn, &config, &connected, &logger);
@@ -280,7 +282,14 @@ fn prune_phase(
             && !plan.prune_candidates.is_empty()
             && let Some(counts) = counts_per_type.get_mut(ty)
         {
-            do_destroy(net, *ty, plan, logger, counts);
+            let destroyed = do_destroy(net, *ty, plan, logger, counts);
+            if *ty == ObjectType::Email
+                && let Err(e) = email::forget_destroyed(ctx, net, plan, &destroyed)
+            {
+                logger.warn(&format!(
+                    "prune: dropping destroyed ids from the Email id cache failed: {e}"
+                ));
+            }
         }
     }
     Ok(())
@@ -355,9 +364,22 @@ fn reconcile_type(
 pub struct Plan {
     pub prune_candidates: Vec<String>,
     pub active_sieve_target: Option<String>,
+    /// Email only: local archive ids for `prune_candidates`, same order.
+    /// Lets the prune phase drop the matching `export_target_ids` cache row
+    /// once (and only once) the target confirms the object was destroyed.
+    pub prune_local_ids: Vec<i64>,
 }
 
-fn do_destroy(net: &Net, ty: ObjectType, plan: &Plan, logger: &Logger, counts: &mut TypeCounts) {
+/// Returns the ids the target confirmed as destroyed, so a caller with its
+/// own bookkeeping tied to those ids (the Email id cache) can retire exactly
+/// the entries that no longer need to survive for a future rerun.
+fn do_destroy(
+    net: &Net,
+    ty: ObjectType,
+    plan: &Plan,
+    logger: &Logger,
+    counts: &mut TypeCounts,
+) -> Vec<String> {
     if ty == ObjectType::SieveScript {
         deactivate_active_sieve_script(net, logger);
     }
@@ -389,6 +411,7 @@ fn do_destroy(net: &Net, ty: ObjectType, plan: &Plan, logger: &Logger, counts: &
                 ));
                 counts.skipped += 1;
             }
+            outcome.destroyed
         }
         Err(e) => {
             logger.warn(&format!(
@@ -396,6 +419,7 @@ fn do_destroy(net: &Net, ty: ObjectType, plan: &Plan, logger: &Logger, counts: &
                 ty.jmap_name()
             ));
             counts.failed += plan.prune_candidates.len() as u64;
+            Vec::new()
         }
     }
 }

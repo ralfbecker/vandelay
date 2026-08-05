@@ -156,6 +156,7 @@ fn export_email_already_exists_is_matched_not_failed() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -298,6 +299,7 @@ fn export_mailbox_name_collision_merges_without_create() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -457,6 +459,7 @@ fn export_mailbox_already_exists_maps_existing_id() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -624,6 +627,7 @@ fn email_export_sends_one_email_per_import_call() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -792,6 +796,7 @@ fn export_email_blob_not_found_reuploads_and_retries() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -929,6 +934,7 @@ fn export_email_parallel_imports_each_email() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -1065,6 +1071,7 @@ fn export_email_parallel_thousand_emails() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -1082,6 +1089,197 @@ fn export_email_parallel_thousand_emails() {
 
     ups.assert();
     imports.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_assume_not_deleted_skips_existence_verification() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        let mut local_ids = Vec::new();
+        for n in 1..=3 {
+            let raw = format!("From: a@x\r\nSubject: s{n}\r\nMessage-ID: <m{n}@h>\r\n\r\nbody {n}");
+            let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
+            conn.execute(
+                "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+            local_ids.push(conn.last_insert_rowid());
+        }
+        let target_id =
+            db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+        let pairs: Vec<(i64, String)> = local_ids
+            .iter()
+            .map(|id| (*id, format!("x-{id}")))
+            .collect();
+        db::export_ids::upsert_many(&conn, target_id, ObjectType::Email, &pairs).unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    // No existence check should fire at all: the fast path must not touch
+    // the target for anything Email-related.
+    let get_calls = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/(get|query)".into()))
+        .with_status(500)
+        .expect(0)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: Some(vec![ObjectType::Email]),
+            prune: false,
+            yes: true,
+            acl: false,
+            assume_not_deleted_in_destination: true,
+        },
+    )
+    .expect("export run");
+
+    get_calls.assert();
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.skipped, 3);
+    assert_eq!(email.created, 0);
+    assert_eq!(email.failed, 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_prune_removes_source_deleted_and_forgets_cache_row() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        // Only two local emails survive; local id 3 was deleted at the
+        // source (and thus dropped from `emails`) since the last export,
+        // but its export_target_ids cache row from that export is still
+        // here, same as it would be on a real archive.
+        for n in 1..=2 {
+            let raw = format!("From: a@x\r\nSubject: s{n}\r\nMessage-ID: <m{n}@h>\r\n\r\nbody {n}");
+            let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
+            conn.execute(
+                "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        }
+        let target_id =
+            db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+        db::export_ids::upsert_many(
+            &conn,
+            target_id,
+            ObjectType::Email,
+            &[
+                (1, "x-1".to_owned()),
+                (2, "x-2".to_owned()),
+                (3, "x-3".to_owned()),
+            ],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    // try_cached only verifies the two ids still backed by a local row.
+    let _eg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","list":[
+                {"id":"x-1"},{"id":"x-2"}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let destroy = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/set".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/set",
+                {"accountId":"w","destroyed":["x-3"],"notDestroyed":{}},"d"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: Some(vec![ObjectType::Email]),
+            prune: true,
+            yes: true,
+            acl: false,
+            assume_not_deleted_in_destination: false,
+        },
+    )
+    .expect("export run");
+
+    destroy.assert();
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.skipped, 2, "the two surviving local rows are matched");
+    assert_eq!(email.deleted, 1, "the source-deleted id is pruned");
+    assert_eq!(email.failed, 0);
+
+    let conn = db::init::open(&archive).unwrap();
+    let target_id =
+        db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+    let cache = db::export_ids::all_for_type(&conn, target_id, ObjectType::Email).unwrap();
+    assert_eq!(
+        cache.len(),
+        2,
+        "the destroyed id's cache row must be forgotten, the surviving two kept"
+    );
+    assert!(!cache.contains_key(&3));
+
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -1204,6 +1402,7 @@ fn export_email_parallel_blob_not_found_self_heals() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -1388,6 +1587,7 @@ fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ExportConfig {
         prune: false,
         yes: true,
         acl: false,
+        assume_not_deleted_in_destination: false,
     }
 }
 
@@ -3938,6 +4138,7 @@ fn export_email_batches_blob_upload_when_server_supports_it() {
             prune: false,
             yes: true,
             acl: false,
+            assume_not_deleted_in_destination: false,
         },
     )
     .expect("export run");
@@ -3982,6 +4183,7 @@ fn acl_session_body(base: &str) -> String {
 fn acl_export_config(base: &str) -> ExportConfig {
     ExportConfig {
         acl: true,
+        assume_not_deleted_in_destination: false,
         ..export_cfg_objects(base, vec![ObjectType::Mailbox])
     }
 }
@@ -4054,6 +4256,7 @@ fn export_acl_skips_when_target_lacks_sharing_capabilities() {
         common(&archive),
         ExportConfig {
             acl: true,
+            assume_not_deleted_in_destination: false,
             ..export_cfg_objects(&base, vec![])
         },
     )
@@ -4216,6 +4419,7 @@ fn export_acl_standalone_via_objects_resolves_existing_mailboxes_without_creatin
         common(&archive),
         ExportConfig {
             acl: true,
+            assume_not_deleted_in_destination: false,
             ..export_cfg_objects(&base, vec![])
         },
     )

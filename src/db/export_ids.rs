@@ -83,6 +83,29 @@ pub fn upsert_many(
     tx.commit()
 }
 
+/// Drops cache rows for `local_ids`, e.g. once the target has confirmed the
+/// objects they pointed at are actually gone, so a future reconcile stops
+/// treating them as still cached.
+pub fn delete_many(
+    conn: &Connection,
+    target_id: i64,
+    ty: ObjectType,
+    local_ids: &[i64],
+) -> Result<(), rusqlite::Error> {
+    if local_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for local_id in local_ids {
+        tx.execute(
+            "DELETE FROM export_target_ids
+             WHERE target_id = ?1 AND type_name = ?2 AND local_id = ?3",
+            params![target_id, ty.jmap_name(), local_id],
+        )?;
+    }
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +161,37 @@ mod tests {
         let b = ensure_target(&c, "https://b/jmap", "w").unwrap();
         upsert(&c, a, ObjectType::Email, 1, "on-a").unwrap();
         assert!(all_for_type(&c, b, ObjectType::Email).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_many_removes_only_the_named_rows() {
+        let c = mem();
+        let t = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        upsert_many(
+            &c,
+            t,
+            ObjectType::Email,
+            &[
+                (1, "e1".to_owned()),
+                (2, "e2".to_owned()),
+                (3, "e3".to_owned()),
+            ],
+        )
+        .unwrap();
+        delete_many(&c, t, ObjectType::Email, &[2]).unwrap();
+        let map = all_for_type(&c, t, ObjectType::Email).unwrap();
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key(&2));
+        assert!(map.contains_key(&1) && map.contains_key(&3));
+    }
+
+    #[test]
+    fn delete_many_with_empty_ids_is_a_no_op() {
+        let c = mem();
+        let t = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        upsert(&c, t, ObjectType::Email, 1, "e1").unwrap();
+        delete_many(&c, t, ObjectType::Email, &[]).unwrap();
+        assert_eq!(all_for_type(&c, t, ObjectType::Email).unwrap().len(), 1);
     }
 
     #[test]

@@ -466,6 +466,7 @@ pub fn reconcile(
     Ok(Plan {
         prune_candidates: crate::sync::prune::candidates(&objs, true),
         active_sieve_target: None,
+        prune_local_ids: Vec::new(),
     })
 }
 

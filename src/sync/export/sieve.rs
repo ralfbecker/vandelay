@@ -136,5 +136,6 @@ pub fn reconcile(
     Ok(Plan {
         prune_candidates,
         active_sieve_target: active_target,
+        prune_local_ids: Vec::new(),
     })
 }

@@ -85,6 +85,7 @@ fn export_cfg(base_url: &str, domain: &str, localpart: &str, account_id: &str) -
         prune: false,
         yes: true,
         acl: false,
+        assume_not_deleted_in_destination: false,
     }
 }
 
