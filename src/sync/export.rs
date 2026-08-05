@@ -191,6 +191,13 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
     }
 
     let acl_counts = if config.acl {
+        if !work.contains(&ObjectType::Mailbox)
+            && let Err(e) = tree::resolve_existing(&ctx, &net, ObjectType::Mailbox, &mut maps)
+        {
+            logger.warn(&format!(
+                "--acl export: resolving existing target mailboxes failed: {e}"
+            ));
+        }
         Some(acl::export(&ctx, &net, &maps, &logger))
     } else {
         None

@@ -368,7 +368,8 @@ struct ExportArgs {
     #[arg(
         long,
         value_name = "LIST",
-        help = "Types to export (default: all present in archive)"
+        help = "Types to export (default: all present in archive); \
+                include \"acl\" to also/only export mailbox ACLs"
     )]
     objects: Option<String>,
 
@@ -380,7 +381,8 @@ struct ExportArgs {
 
     #[arg(
         long,
-        help = "Export mailbox ACLs as JMAP shareWith (requires target mail-sharing support)"
+        help = "Export mailbox ACLs as JMAP shareWith (requires target mail-sharing support); \
+                implied by including \"acl\" in --objects"
     )]
     acl: bool,
 
@@ -902,7 +904,13 @@ fn resolve_export(args: ExportArgs) -> Result<Action, Error> {
         args.auth_bearer.as_ref(),
     )?;
     let account = resolve_account(args.account_id, args.account_name)?;
-    let objects = args.objects.as_deref().map(parse_object_list).transpose()?;
+    let (objects, acl_in_objects) = match args.objects.as_deref() {
+        Some(raw) => {
+            let (types, acl) = parse_export_object_list(raw)?;
+            (Some(types), acl)
+        }
+        None => (None, false),
+    };
 
     Ok(Action::Export(
         common,
@@ -915,9 +923,39 @@ fn resolve_export(args: ExportArgs) -> Result<Action, Error> {
             objects,
             prune: args.prune,
             yes: args.yes,
-            acl: args.acl,
+            acl: args.acl || acl_in_objects,
         },
     ))
+}
+
+/// Like [`parse_object_list`], but additionally recognizes the pseudo-type
+/// "acl" (not a real [`ObjectType`], so not part of `ObjectType::ALL`): its
+/// presence is reported back as a bool instead, letting `--objects=acl` run
+/// standalone without requiring `--acl` and without exporting any other
+/// object type. `--objects=acl,mailbox` exports both.
+fn parse_export_object_list(list: &str) -> Result<(Vec<ObjectType>, bool), Error> {
+    let mut acl = false;
+    let mut types = Vec::new();
+    for token in list.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("acl") {
+            acl = true;
+            continue;
+        }
+        let parsed = ObjectType::parse(token)?;
+        if !types.contains(&parsed) {
+            types.push(parsed);
+        }
+    }
+    if !acl && types.is_empty() {
+        return Err(Error::Usage(
+            "--objects given but resolved to an empty type list".to_owned(),
+        ));
+    }
+    Ok((types, acl))
 }
 
 fn resolve_inspect(args: InspectArgs) -> Result<Action, Error> {
@@ -1417,5 +1455,39 @@ mod tests {
         let bearer: Option<String> = Some("t".to_owned());
         let auth = resolve_auth(None, None, Some(&bearer)).unwrap();
         assert!(matches!(auth, Auth::Bearer { token } if token == "t"));
+    }
+
+    #[test]
+    fn export_object_list_acl_alone_yields_no_types_and_acl_flag() {
+        let (types, acl) = parse_export_object_list("acl").unwrap();
+        assert!(types.is_empty());
+        assert!(acl);
+    }
+
+    #[test]
+    fn export_object_list_acl_combined_with_type_keeps_both() {
+        let (types, acl) = parse_export_object_list("acl,mailbox").unwrap();
+        assert_eq!(types, vec![ObjectType::Mailbox]);
+        assert!(acl);
+    }
+
+    #[test]
+    fn export_object_list_is_case_insensitive_for_acl() {
+        let (types, acl) = parse_export_object_list("ACL").unwrap();
+        assert!(types.is_empty());
+        assert!(acl);
+    }
+
+    #[test]
+    fn export_object_list_without_acl_behaves_like_parse_object_list() {
+        let (types, acl) = parse_export_object_list("mailbox,email").unwrap();
+        assert_eq!(types, vec![ObjectType::Mailbox, ObjectType::Email]);
+        assert!(!acl);
+    }
+
+    #[test]
+    fn export_object_list_empty_without_acl_is_usage_error() {
+        let r = parse_export_object_list("");
+        assert!(matches!(r, Err(Error::Usage(_))));
     }
 }

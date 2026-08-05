@@ -38,6 +38,85 @@ struct TargetNode {
     may_delete: bool,
 }
 
+/// Result of matching local nodes against whatever already exists on the
+/// target, by role (Mailbox only) and then by walking the hierarchy and
+/// matching siblings by folded name. Shared between [`reconcile`], which
+/// goes on to create whatever is left unmatched, and [`resolve_existing`],
+/// which only needs the matches themselves.
+struct Matched {
+    locals: Vec<LocalNode>,
+    targets: Vec<TargetNode>,
+    by_local: HashMap<i64, String>,
+    tmatched: HashSet<String>,
+}
+
+fn match_existing(ctx: &Context, net: &Net, ty: ObjectType) -> Result<Matched, Error> {
+    let locals = load_local(ctx, ty)?;
+    let targets = load_target(net, ty, ctx.common.threads)?;
+
+    let mut matched: HashMap<i64, String> = HashMap::new();
+    let mut tmatched: HashSet<String> = HashSet::new();
+
+    if ty == ObjectType::Mailbox {
+        for t in &targets {
+            if let Some(r) = &t.role
+                && let Some(l) = locals.iter().find(|l| {
+                    l.role.as_deref() == Some(r.as_str()) && !matched.contains_key(&l.local)
+                })
+            {
+                matched.insert(l.local, t.id.clone());
+                tmatched.insert(t.id.clone());
+            }
+        }
+    }
+
+    let mut stack: Vec<(Option<i64>, Option<String>)> = vec![(None, None)];
+    for (l, tid) in matched.clone() {
+        stack.push((Some(l), Some(tid)));
+    }
+    while let Some((lp, tp)) = stack.pop() {
+        let lchildren: Vec<&LocalNode> = locals
+            .iter()
+            .filter(|n| n.parent == lp && !matched.contains_key(&n.local))
+            .collect();
+        for ln in lchildren {
+            if let Some(tn) = targets.iter().find(|t| {
+                t.parent.as_deref() == tp.as_deref()
+                    && !tmatched.contains(&t.id)
+                    && fold_name(&t.name) == fold_name(&ln.name)
+            }) {
+                matched.insert(ln.local, tn.id.clone());
+                tmatched.insert(tn.id.clone());
+                stack.push((Some(ln.local), Some(tn.id.clone())));
+            }
+        }
+    }
+
+    Ok(Matched {
+        locals,
+        targets,
+        by_local: matched,
+        tmatched,
+    })
+}
+
+/// Matches local Mailboxes against whatever already exists on the target and
+/// records the result in `maps`, without creating or pruning anything. Used
+/// for a standalone `--objects acl` export run, where the ACL post-pass
+/// needs target Mailbox ids but Mailbox itself is not part of the run.
+pub fn resolve_existing(
+    ctx: &Context,
+    net: &Net,
+    ty: ObjectType,
+    maps: &mut Maps,
+) -> Result<(), Error> {
+    let m = match_existing(ctx, net, ty)?;
+    for (l, tid) in &m.by_local {
+        maps.insert(ty, *l, JmapId(tid.clone()));
+    }
+    Ok(())
+}
+
 fn load_local(ctx: &Context, ty: ObjectType) -> Result<Vec<LocalNode>, Error> {
     let table = crate::sync::table_name(ty);
     let mut stmt = ctx
@@ -139,46 +218,11 @@ pub fn reconcile(
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<Plan, Error> {
-    let locals = load_local(ctx, ty)?;
-    let targets = load_target(net, ty, ctx.common.threads)?;
-
-    let mut matched: HashMap<i64, String> = HashMap::new();
-    let mut tmatched: HashSet<String> = HashSet::new();
-
-    if ty == ObjectType::Mailbox {
-        for t in &targets {
-            if let Some(r) = &t.role
-                && let Some(l) = locals.iter().find(|l| {
-                    l.role.as_deref() == Some(r.as_str()) && !matched.contains_key(&l.local)
-                })
-            {
-                matched.insert(l.local, t.id.clone());
-                tmatched.insert(t.id.clone());
-            }
-        }
-    }
-
-    let mut stack: Vec<(Option<i64>, Option<String>)> = vec![(None, None)];
-    for (l, tid) in matched.clone() {
-        stack.push((Some(l), Some(tid)));
-    }
-    while let Some((lp, tp)) = stack.pop() {
-        let lchildren: Vec<&LocalNode> = locals
-            .iter()
-            .filter(|n| n.parent == lp && !matched.contains_key(&n.local))
-            .collect();
-        for ln in lchildren {
-            if let Some(tn) = targets.iter().find(|t| {
-                t.parent.as_deref() == tp.as_deref()
-                    && !tmatched.contains(&t.id)
-                    && fold_name(&t.name) == fold_name(&ln.name)
-            }) {
-                matched.insert(ln.local, tn.id.clone());
-                tmatched.insert(tn.id.clone());
-                stack.push((Some(ln.local), Some(tn.id.clone())));
-            }
-        }
-    }
+    let m = match_existing(ctx, net, ty)?;
+    let locals = m.locals;
+    let targets = m.targets;
+    let matched = m.by_local;
+    let mut tmatched = m.tmatched;
 
     for (l, tid) in &matched {
         maps.insert(ty, *l, JmapId(tid.clone()));

@@ -4144,6 +4144,98 @@ fn export_acl_pushes_share_with_computed_from_imap_rights() {
     let _ = std::fs::remove_file(&archive);
 }
 
+/// `--objects acl` (no `--acl` flag, no `mailbox` in `--objects`) must still
+/// push ACLs: it should resolve local mailboxes against whatever already
+/// exists on the target (matching only, no Mailbox/set create) and then
+/// export shareWith as usual.
+#[test]
+fn export_acl_standalone_via_objects_resolves_existing_mailboxes_without_creating() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        db::acls::replace_for_mailbox(
+            &conn,
+            1,
+            &[("jdoe@example.com".to_owned(), "lrswikta".to_owned())],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(acl_session_body(&base))
+        .create();
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
+    let _pq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Principal/query".into()))
+        .with_body(
+            json!({"methodResponses":[
+                ["Principal/query", {"accountId":"w","ids":["p1"]}, "q0"],
+                ["Principal/get", {"accountId":"w",
+                    "list":[{"id":"p1","email":"jdoe@example.com"}],"notFound":[]}, "g0"]
+            ]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _current = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("shareWith".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",
+                {"accountId":"w","list":[{"id":"t1","shareWith":null}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/set".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",
+                {"accountId":"w","updated":{"t1":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    // No Mailbox in --objects: this is what CLI parsing produces for a bare
+    // `--objects acl` (see parse_export_object_list in src/cli.rs).
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            acl: true,
+            ..export_cfg_objects(&base, vec![])
+        },
+    )
+    .expect("export");
+
+    assert!(
+        summary.per_type.iter().all(|(k, _)| *k != "Mailbox"),
+        "Mailbox should not run as its own export phase: {:?}",
+        summary.per_type
+    );
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 1);
+    assert_eq!(acl_counts.1.failed, 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
 #[test]
 fn export_acl_merges_with_shares_already_on_the_target() {
     let mut server = mockito::Server::new();
