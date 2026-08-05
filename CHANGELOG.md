@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.0.7] - 2026-07-XX
+## [1.0.7] - 2026-07-26
 
 ### Added
 
@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file. This projec
 - WebDAV import materialised the account root collection as a directory named after the account displayname (#18).
 - Report user friendly error message when `urn:ietf:params:jmap:principals` is not supported and no accountId is provided (#21).
 - Report which email failed to import when the blob is too large (#22).
+- IMAP import failed with "LIST mailbox name missing" when a mailbox name is a purely numeric unquoted atom (#26).
 
 ## [1.0.6] - 2026-07-12
 

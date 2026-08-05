@@ -229,6 +229,7 @@ impl<'r, R: BufRead> Parser<'r, R> {
                 let name_val = self.parse_value()?;
                 let name = match name_val {
                     Value::Str(s) | Value::Atom(s) => s,
+                    Value::Number(n) => n.to_string(),
                     Value::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
                     _ => return Err(ImapError::Parse("LIST mailbox name missing".into())),
                 };
@@ -250,6 +251,7 @@ impl<'r, R: BufRead> Parser<'r, R> {
                 self.skip_ws();
                 let mailbox = match self.parse_value()? {
                     Value::Str(s) | Value::Atom(s) => s,
+                    Value::Number(n) => n.to_string(),
                     Value::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
                     _ => return Err(ImapError::Parse("STATUS mailbox missing".into())),
                 };
@@ -899,6 +901,26 @@ mod tests {
     }
 
     #[test]
+    fn untagged_list_with_numeric_atom_name() {
+        let r = parse(b"* LIST (\\Subscribed \\HasNoChildren \\UnMarked) \"/\" 200\r\n");
+        match r {
+            Response::Untagged(Untagged::List {
+                attributes,
+                delimiter,
+                name,
+            }) => {
+                assert_eq!(
+                    attributes,
+                    vec!["\\Subscribed", "\\HasNoChildren", "\\UnMarked"]
+                );
+                assert_eq!(delimiter, Some('/'));
+                assert_eq!(name, "200");
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
     fn untagged_status() {
         let r = parse(b"* STATUS INBOX (UIDVALIDITY 12345 UIDNEXT 42 MESSAGES 7)\r\n");
         match r {
@@ -984,6 +1006,20 @@ mod tests {
                 assert!(entries.is_empty());
             }
             _ => panic!("expected Acl"),
+        }
+    }
+
+    #[test]
+    fn untagged_status_with_numeric_atom_mailbox() {
+        let r = parse(b"* STATUS 200 (MESSAGES 5 UIDNEXT 6 UIDVALIDITY 1778253936)\r\n");
+        match r {
+            Response::Untagged(Untagged::Status { mailbox, items }) => {
+                assert_eq!(mailbox, "200");
+                assert_eq!(items.get("MESSAGES"), Some(&5));
+                assert_eq!(items.get("UIDNEXT"), Some(&6));
+                assert_eq!(items.get("UIDVALIDITY"), Some(&1778253936));
+            }
+            _ => panic!("expected Status"),
         }
     }
 

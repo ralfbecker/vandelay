@@ -89,7 +89,14 @@ impl Logger {
         eprintln!("{proto} {command} -> {status} ({} ms)", elapsed.as_millis());
     }
 
-    pub fn trace_http_error(&self, proto: &str, method: &str, url: &str, error: &str, elapsed: Duration) {
+    pub fn trace_http_error(
+        &self,
+        proto: &str,
+        method: &str,
+        url: &str,
+        error: &str,
+        elapsed: Duration,
+    ) {
         if !self.enabled(LEVEL_METHOD) {
             return;
         }
@@ -222,7 +229,10 @@ mod tests {
 
     #[test]
     fn redact_wire_hides_login_arguments() {
-        assert_eq!(redact_wire("LOGIN \"alice\" \"s3cret\""), "LOGIN <redacted>");
+        assert_eq!(
+            redact_wire("LOGIN \"alice\" \"s3cret\""),
+            "LOGIN <redacted>"
+        );
     }
 
     #[test]
@@ -264,7 +274,11 @@ mod tests {
     fn body_for_log_caps_long_text_without_scanning_whole_blob() {
         let body = vec![b'a'; TRACE_BODY_CAP * 4];
         let out = body_for_log(&body, Some("text/plain"));
-        assert!(out.contains("bytes total>"), "got tail {}", &out[out.len() - 40..]);
+        assert!(
+            out.contains("bytes total>"),
+            "got tail {}",
+            &out[out.len() - 40..]
+        );
         assert!(out.len() < body.len());
     }
 

@@ -154,7 +154,8 @@ impl Cyrus {
         let request = image
             .with_exposed_port(IMAP_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout("cyrus provisioned"))
-            .with_startup_timeout(Duration::from_secs(180));
+            .with_startup_timeout(Duration::from_secs(180))
+            .with_labels([(super::OWNER_LABEL, "1")]);
 
         let container = request.start()?;
         let host = container.get_host()?.to_string();

@@ -148,7 +148,8 @@ impl WebDav {
         let request = image
             .with_exposed_port(HTTP_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stderr("AH00558"))
-            .with_startup_timeout(Duration::from_secs(120));
+            .with_startup_timeout(Duration::from_secs(120))
+            .with_labels([(super::OWNER_LABEL, "1")]);
 
         let container = request.start()?;
         let host = container.get_host()?.to_string();

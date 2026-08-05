@@ -151,8 +151,12 @@ impl SieveClient {
         let started = Instant::now();
         self.write_all(command.as_bytes())?;
         let block = read_response(&mut self.reader)?;
-        self.logger
-            .trace_cmd("SIEVE", command, &sieve_status(&block.status), started.elapsed());
+        self.logger.trace_cmd(
+            "SIEVE",
+            command,
+            &sieve_status(&block.status),
+            started.elapsed(),
+        );
         finish_block(block, &mut self.closed)
     }
 

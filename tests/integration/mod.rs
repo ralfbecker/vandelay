@@ -22,6 +22,8 @@ pub mod webdav;
 
 pub use error::{ContainerError, ContainerResult};
 
+pub const OWNER_LABEL: &str = "art.stalw.vandelay.itest";
+
 use std::sync::Once;
 
 static CRYPTO_INIT: Once = Once::new();
