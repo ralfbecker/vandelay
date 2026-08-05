@@ -142,6 +142,7 @@ pub fn reconcile(
             &fallback_ids,
             Some(&["messageId", "from", "subject", "sentAt", "to"]),
             ctx.common.threads,
+            |_| {},
         )
         .map_err(Error::from)?;
         let by_id: HashMap<String, &Value> = got
@@ -268,14 +269,15 @@ fn try_cached(
         .iter()
         .map(|(local_id, _)| JmapId(cached[local_id].clone()))
         .collect();
-    let found = get_objects_parallel(net, ObjectType::Email, &ids, Some(&[]), threads)
-        .map_err(Error::from)?;
+    let found = get_objects_parallel(net, ObjectType::Email, &ids, Some(&[]), threads, |n| {
+        crate::progress::advance(n as u64);
+    })
+    .map_err(Error::from)?;
     if found.len() != ids.len() {
         return Ok(None);
     }
     for _ in local {
         counts.skipped += 1;
-        crate::progress::advance(1);
     }
     Ok(Some(Plan::default()))
 }

@@ -484,7 +484,7 @@ mod common {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        get_objects_parallel(net, ty, &ids, props, threads)
+        get_objects_parallel(net, ty, &ids, props, threads, |_| {})
     }
 
     /// Fetches `ids` in parallel chunks bounded by the server's advertised
@@ -496,17 +496,25 @@ mod common {
     /// on it, this fetch — not the creation loop that follows — is the part
     /// that dominates wall-clock time, and it previously ran one request at
     /// a time regardless of `--threads`.
+    ///
+    /// `on_chunk` is called on the calling thread with the size of each
+    /// chunk as its result arrives, so a caller whose `ids` line up 1:1 with
+    /// the active progress phase's total (e.g. a per-local-row existence
+    /// check) can report incremental progress during the fetch instead of
+    /// only after it fully completes. Callers where that correspondence
+    /// doesn't hold pass a no-op.
     pub fn get_objects_parallel(
         net: &Net,
         ty: ObjectType,
         ids: &[JmapId],
         props: Option<&[&str]>,
         threads: usize,
+        mut on_chunk: impl FnMut(usize),
     ) -> Result<Vec<Value>, JmapError> {
         let chunk = net.limits.max_objects_in_get.max(1) as usize;
         let workers = effective_workers(threads, &net.limits, false);
         if workers <= 1 || ids.len() <= chunk {
-            return Ok(get_objects::<Value>(
+            let list = get_objects::<Value>(
                 &net.client,
                 &net.api,
                 &net.account,
@@ -515,7 +523,9 @@ mod common {
                 props,
                 &net.limits,
             )?
-            .list);
+            .list;
+            on_chunk(list.len());
+            return Ok(list);
         }
 
         let type_name = ty.jmap_name();
@@ -539,19 +549,30 @@ mod common {
                 .map(|r| r.list)
             }
         });
+        let mut submitted = 0usize;
         for group in ids.chunks(chunk) {
             pool.submit(group.to_vec());
+            submitted += 1;
         }
 
+        // Drained as each chunk completes (not via `pool.finish()`, which
+        // only yields once every worker has already finished) so `on_chunk`
+        // fires incrementally across the whole fetch rather than all at once
+        // at the end.
         let mut out = Vec::with_capacity(ids.len());
         let mut first_err = None;
-        for res in pool.finish() {
-            match res {
-                Ok(list) => out.extend(list),
-                Err(e) if first_err.is_none() => first_err = Some(e),
-                Err(_) => {}
+        for _ in 0..submitted {
+            match pool.results().recv() {
+                Ok(Ok(list)) => {
+                    on_chunk(list.len());
+                    out.extend(list);
+                }
+                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                Ok(Err(_)) => {}
+                Err(_) => break,
             }
         }
+        pool.finish();
         if let Some(e) = first_err {
             return Err(e);
         }
