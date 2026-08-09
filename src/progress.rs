@@ -43,6 +43,17 @@ pub fn advance(n: u64) {
     }
 }
 
+/// Reset the current phase's completed count back to `done`, without
+/// touching its label, total, or start time. For a phase that abandons a
+/// speculative attempt partway through (advancing progress along the way)
+/// and falls back to redoing the same work from scratch, so the fallback's
+/// own advances don't stack on top of the abandoned attempt's.
+pub fn reset(done: u64) {
+    if let Some(p) = get() {
+        p.reset(done);
+    }
+}
+
 /// End the current phase, leaving a final line in the scrollback.
 pub fn finish() {
     if let Some(p) = get() {
@@ -101,6 +112,13 @@ impl Progress {
         phase.done += n;
         if phase.last_render.elapsed() >= self.interval() {
             self.render(phase, false);
+        }
+    }
+
+    fn reset(&self, done: u64) {
+        let mut guard = lock(&self.state);
+        if let Some(phase) = guard.as_mut() {
+            phase.done = done;
         }
     }
 
@@ -232,11 +250,24 @@ mod tests {
     }
 
     #[test]
+    fn reset_rewinds_done_without_touching_total_or_start() {
+        let p = Progress::new(true);
+        p.start("Email", Some(400));
+        p.advance(300);
+        p.reset(0);
+        let guard = p.state.lock().unwrap();
+        let phase = guard.as_ref().unwrap();
+        assert_eq!(phase.done, 0);
+        assert_eq!(phase.total, Some(400));
+    }
+
+    #[test]
     fn disabled_reporter_is_inert() {
         let p = Progress::new(false);
         assert!(!p.enabled);
         p.start("Email", Some(10));
         p.advance(1);
+        p.reset(0);
         p.finish();
     }
 }

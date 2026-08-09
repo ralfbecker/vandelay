@@ -162,10 +162,18 @@ pub fn reconcile(
                 record_state_for_next_run(ctx, net, target_row, logger);
                 return Ok(plan);
             }
-            None => logger.warn(
-                "Email: cached target ids are stale (target changed since last export); \
-                 rebuilding the full match instead of trusting the cache",
-            ),
+            None => {
+                // try_cached's existence check already advanced progress
+                // speculatively for the ids it verified before finding a
+                // stale one; the full rebuild below re-walks every local row
+                // and advances again, so undo those first or the total
+                // roughly doubles.
+                crate::progress::reset(0);
+                logger.warn(
+                    "Email: cached target ids are stale (target changed since last export); \
+                     rebuilding the full match instead of trusting the cache",
+                );
+            }
         }
     }
 
