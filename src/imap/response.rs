@@ -767,11 +767,15 @@ impl<'r, R: BufRead> Parser<'r, R> {
     }
 }
 
+// RFC 3501 defines ATOM-CHAR as any CHAR except atom-specials, i.e. an
+// exclusion list on top of "any printable byte" rather than an allowlist of
+// specific characters. A prior hand-picked allowlist here rejected legal
+// atom bytes it simply hadn't enumerated (e.g. ':', seen in an unquoted
+// Dovecot ACL identifier), which is worse than being merely too permissive:
+// an atom that fails to parse mid-response desyncs the reader for the rest
+// of the session, since nothing after it resumes at the right line.
 fn is_atom_byte(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-        | b'-' | b'.' | b'_' | b'!' | b'#' | b'$' | b'&'
-        | b'\'' | b'+' | b'/' | b';' | b'<' | b'=' | b'>' | b'?'
-        | b'@' | b'\\' | b'^' | b'`' | b'|' | b'~' | b'*')
+    matches!(b, 0x21..=0x7e) && !matches!(b, b'(' | b')' | b'{' | b'%' | b'"' | b']')
 }
 
 fn parse_seq_set(s: &str) -> Vec<u32> {
@@ -992,6 +996,18 @@ mod tests {
                         ("jdoe".to_owned(), "lrswikta".to_owned()),
                     ]
                 );
+            }
+            _ => panic!("expected Acl"),
+        }
+    }
+
+    #[test]
+    fn untagged_acl_with_colon_in_bare_atom_identifier() {
+        let r = parse(b"* ACL INBOX group:staff lrs\r\n");
+        match r {
+            Response::Untagged(Untagged::Acl { mailbox, entries }) => {
+                assert_eq!(mailbox, "INBOX");
+                assert_eq!(entries, vec![("group:staff".to_owned(), "lrs".to_owned())]);
             }
             _ => panic!("expected Acl"),
         }
