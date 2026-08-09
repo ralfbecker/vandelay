@@ -418,7 +418,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     )
     .map_err(|e| Error::Connection(format!("worker pool: {e}")))?;
 
-    for (i, folder) in resolved.iter().enumerate() {
+    for (i, folder) in resolved.iter().filter(|f| f.selectable).enumerate() {
         if i > 0 {
             let _ = control_run_collect(&mut client, &control_ctx, "NOOP");
         }
@@ -1172,7 +1172,7 @@ fn dry_run_summary(
         );
     }
 
-    for folder in folders {
+    for folder in folders.iter().filter(|f| f.selectable) {
         let wire = encode_mailbox_name_with(&folder.name, client.utf8_accept());
         let select_resp = match control_run_collect(client, control_ctx, &command::select(&wire)) {
             Ok(r) => r,

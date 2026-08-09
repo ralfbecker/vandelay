@@ -121,11 +121,33 @@ pub fn apply_new(
     bytes: &[u8],
 ) -> Result<i64, Error> {
     let blob_id = db::blobs::intern_blob(tx, bytes)?;
-    tx.execute(
-        "INSERT INTO sieve_scripts (name, is_active, blob_id) VALUES (?1, 0, ?2)",
-        params![name, blob_id],
-    )?;
-    let local_id = tx.last_insert_rowid();
+    // `sieve_scripts.name` is globally unique in the archive, but the
+    // id-mapping this action is based on ("New" = not yet mapped) is scoped
+    // to `source_id`. After --allow-source-change re-points the archive at a
+    // new source, a script of this name can already exist from the old one;
+    // inserting again would hit the UNIQUE constraint. Adopting the existing
+    // row instead keeps a "same account, new connection details" rerun
+    // convergent rather than failing.
+    let existing_id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM sieve_scripts WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let local_id = if let Some(id) = existing_id {
+        tx.execute(
+            "UPDATE sieve_scripts SET blob_id = ?1 WHERE id = ?2",
+            params![blob_id, id],
+        )?;
+        id
+    } else {
+        tx.execute(
+            "INSERT INTO sieve_scripts (name, is_active, blob_id) VALUES (?1, 0, ?2)",
+            params![name, blob_id],
+        )?;
+        tx.last_insert_rowid()
+    };
     db::managesieve_ids::insert(tx, source_id, name, local_id)?;
     Ok(local_id)
 }
@@ -322,6 +344,51 @@ mod tests {
             .query_row("SELECT count(*) FROM sieve_scripts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn apply_new_adopts_existing_row_left_by_a_different_source() {
+        let (mut c, old_sid) = mem();
+        let tx = c.transaction().unwrap();
+        let old_id = apply_new(&tx, old_sid, "mail", b"require [\"fileinto\"];\n").unwrap();
+        tx.commit().unwrap();
+
+        // Simulate --allow-source-change: a new source row, unrelated to the
+        // old one, with no id-mapping of its own yet for "mail".
+        let new_sid = db::sources::upsert_source(
+            &c,
+            &db::sources::SourceKey {
+                kind: "managesieve".to_owned(),
+                session_url: "sieve://new-host:4190".to_owned(),
+                account_id: "a".to_owned(),
+            },
+            None,
+            "a",
+        )
+        .unwrap();
+        assert_ne!(old_sid, new_sid);
+
+        let tx = c.transaction().unwrap();
+        let id = apply_new(&tx, new_sid, "mail", b"require [\"vacation\"];\n").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(id, old_id, "must reuse the existing row, not duplicate it");
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM sieve_scripts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "no duplicate row under the new source");
+        let local = db::managesieve_ids::local_for(&c, new_sid, "mail")
+            .unwrap()
+            .unwrap();
+        assert_eq!(local, old_id);
+        let blob: Vec<u8> = c
+            .query_row(
+                "SELECT b.data FROM sieve_scripts s JOIN blobs b ON b.id = s.blob_id WHERE s.id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob, b"require [\"vacation\"];\n");
     }
 
     #[test]

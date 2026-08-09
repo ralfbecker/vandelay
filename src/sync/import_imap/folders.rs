@@ -38,6 +38,11 @@ pub struct ResolvedFolder {
     pub role: Option<&'static str>,
     pub subscribed: bool,
     pub status: Option<FolderStatus>,
+    /// `false` for a `\Noselect`/`\Nonexistent` hierarchy placeholder: still
+    /// kept in the resolved list (so it counts as present for
+    /// vanished-folder detection and gets a mailbox row for its children to
+    /// attach to), but skipped by anything that SELECTs the mailbox.
+    pub selectable: bool,
 }
 
 pub struct FolderFilters {
@@ -128,9 +133,13 @@ pub fn apply_filters(
     folders: Vec<DiscoveredFolder>,
     filters: &FolderFilters,
 ) -> Vec<ResolvedFolder> {
+    // `\Noselect` folders are kept here (unlike everything filtered by name
+    // below): they still exist on the server and would otherwise look
+    // permanently vanished on every future run, since vanished-detection
+    // compares against this resolved list. Only the actual mail-sync step
+    // skips them, via `selectable`.
     let mut keep: Vec<DiscoveredFolder> = folders
         .into_iter()
-        .filter(|f| f.selectable)
         .filter(|f| match_filters(&f.name, filters))
         .collect();
     if filters.subscribed_only {
@@ -162,6 +171,7 @@ pub fn apply_filters(
             role,
             subscribed: f.subscribed,
             status: f.status,
+            selectable: f.selectable,
         });
     }
     resolved
@@ -312,6 +322,23 @@ mod tests {
     }
 
     #[test]
+    fn noselect_folder_stays_resolved_but_not_selectable() {
+        let folders = collect_from_list(
+            &[
+                lst("INBOX", "/", &[]),
+                lst("INBOX/Archives", "/", &["\\Noselect"]),
+                lst("INBOX/Archives/2020", "/", &[]),
+            ],
+            false,
+        )
+        .unwrap();
+        let res = apply_filters(folders, &filters_default());
+        assert_eq!(res.len(), 3);
+        let archives = res.iter().find(|f| f.name == "INBOX/Archives").unwrap();
+        assert!(!archives.selectable);
+    }
+
+    #[test]
     fn filters_default_keep_everything() {
         let folders = collect_from_list(
             &[
@@ -443,6 +470,7 @@ mod tests {
                 role: None,
                 subscribed: false,
                 status: None,
+                selectable: true,
             },
             ResolvedFolder {
                 name: "INBOX".into(),
@@ -452,6 +480,7 @@ mod tests {
                 role: Some("inbox"),
                 subscribed: true,
                 status: None,
+                selectable: true,
             },
             ResolvedFolder {
                 name: "Projects".into(),
@@ -461,6 +490,7 @@ mod tests {
                 role: None,
                 subscribed: false,
                 status: None,
+                selectable: true,
             },
         ];
         sort_by_depth(&mut r);
