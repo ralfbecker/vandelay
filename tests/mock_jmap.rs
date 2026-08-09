@@ -11,7 +11,8 @@ use vandelay::jmap::account::{self, AccountSelector};
 use vandelay::jmap::error::JmapError;
 use vandelay::jmap::http::{Auth, HttpClient, RetryPolicy};
 use vandelay::jmap::request::{
-    self, SetRequest, get_all, get_changes, get_objects, get_state, set_call,
+    self, SetRequest, get_all, get_changes, get_objects, get_state,
+    query_all_ids_with_progress, set_call,
 };
 use vandelay::jmap::session::{Limits, Session};
 use vandelay::jmap::wire::JmapId;
@@ -165,6 +166,43 @@ fn query_paginates_with_clamped_limit_and_terminates_structurally() {
         request::query_all_ids(&client(2), &url, "w", "Mailbox", &limits(3)).expect("query ok");
     let got: Vec<String> = ids.into_iter().map(|i| i.0).collect();
     assert_eq!(got, vec!["a", "b", "c", "d", "e"]);
+}
+
+#[test]
+fn query_all_ids_with_progress_reports_each_page_size_as_it_arrives() {
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    server
+        .mock("POST", api)
+        .with_status(200)
+        .with_body(page(&["a", "b"]))
+        .expect(1)
+        .create();
+    server
+        .mock("POST", api)
+        .with_status(200)
+        .with_body(page(&["c", "d"]))
+        .expect(1)
+        .create();
+    server
+        .mock("POST", api)
+        .with_status(200)
+        .with_body(page(&["e"]))
+        .expect(1)
+        .create();
+    trailing_empty_page(&mut server, api);
+
+    let url = format!("{}{}", server.url(), api);
+    let mut page_sizes = Vec::new();
+    let ids = query_all_ids_with_progress(&client(2), &url, "w", "Mailbox", &limits(3), |n| {
+        page_sizes.push(n);
+    })
+    .expect("query ok");
+    assert_eq!(ids.len(), 5);
+    // Pagination stops as soon as a page comes back shorter than the first
+    // page's size (2, 2, then a final short page of 1), with no extra
+    // trailing request needed to notice the end.
+    assert_eq!(page_sizes, vec![2, 2, 1]);
 }
 
 #[test]

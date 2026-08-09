@@ -215,9 +215,26 @@ pub fn query_all_ids(
     type_name: &str,
     limits: &Limits,
 ) -> Result<Vec<JmapId>, JmapError> {
+    query_all_ids_with_progress(client, api_url, account_id, type_name, limits, |_| {})
+}
+
+/// Like `query_all_ids`, but calls `on_page` with each page's size as it
+/// arrives. For a target with hundreds of thousands of objects, this
+/// sequential (each page needs the previous page's anchor) pagination can
+/// itself take as long as the parallel `Type/get` fetch that follows it, so a
+/// caller reporting progress over the whole operation needs visibility into
+/// this half too, not just the `get_objects_parallel` half.
+pub fn query_all_ids_with_progress(
+    client: &HttpClient,
+    api_url: &str,
+    account_id: &str,
+    type_name: &str,
+    limits: &Limits,
+    mut on_page: impl FnMut(usize),
+) -> Result<Vec<JmapId>, JmapError> {
     let mut restarts = 0u32;
     loop {
-        match query_pages(client, api_url, account_id, type_name, limits) {
+        match query_pages(client, api_url, account_id, type_name, limits, &mut on_page) {
             Ok(ids) => return Ok(ids),
             Err(JmapError::AnchorNotFound) if restarts < 2 => {
                 restarts += 1;
@@ -233,6 +250,7 @@ fn query_pages(
     account_id: &str,
     type_name: &str,
     limits: &Limits,
+    on_page: &mut impl FnMut(usize),
 ) -> Result<Vec<JmapId>, JmapError> {
     let limit = limits.max_objects_in_get.max(1);
     let mut collected: Vec<JmapId> = Vec::new();
@@ -258,6 +276,7 @@ fn query_pages(
             .and_then(Value::as_array)
             .ok_or_else(|| JmapError::malformed("query response has no ids array"))?;
         let this_len = ids.len();
+        on_page(this_len);
         for v in ids {
             let s = v
                 .as_str()

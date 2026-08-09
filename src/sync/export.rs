@@ -16,7 +16,9 @@ use crate::jmap::blobxfer;
 use crate::jmap::connect::{self, Connected};
 use crate::jmap::error::JmapError;
 use crate::jmap::http::HttpClient;
-use crate::jmap::request::{Request, SetRequest, get_all, get_objects, query_all_ids, set_call};
+use crate::jmap::request::{
+    Request, SetRequest, get_all, get_objects, query_all_ids_with_progress, set_call,
+};
 use crate::jmap::session::{Limits, Session};
 use crate::jmap::wire::JmapId;
 use crate::logging::{LEVEL_DEFAULT, Logger};
@@ -492,23 +494,36 @@ mod email_batch;
 mod common {
     use super::*;
 
+    /// Fetches every object of `ty` currently on the target: first the id
+    /// list (sequential, anchor-based pagination), then their contents
+    /// (parallel `Type/get` chunks). For a target with hundreds of thousands
+    /// of objects already on it, the id-listing pagination alone can run for
+    /// minutes, so both halves report progress rather than only the second
+    /// — otherwise a long-running phase looks frozen for the entire first
+    /// half. The target's own count does not necessarily match whatever
+    /// total the caller's active progress phase was started with (e.g. the
+    /// local row count), so this is a liveliness signal, not a precise
+    /// percentage.
     pub fn target_query_get(
         net: &Net,
         ty: ObjectType,
         props: Option<&[&str]>,
         threads: usize,
     ) -> Result<Vec<Value>, JmapError> {
-        let ids = query_all_ids(
+        let ids = query_all_ids_with_progress(
             &net.client,
             &net.api,
             &net.account,
             ty.jmap_name(),
             &net.limits,
+            |n| crate::progress::advance(n as u64),
         )?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        get_objects_parallel(net, ty, &ids, props, threads, |_| {})
+        get_objects_parallel(net, ty, &ids, props, threads, |n| {
+            crate::progress::advance(n as u64)
+        })
     }
 
     /// Fetches `ids` in parallel chunks bounded by the server's advertised
