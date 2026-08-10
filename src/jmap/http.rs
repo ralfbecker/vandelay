@@ -258,8 +258,39 @@ impl HttpClient {
             };
             match attempt_outcome {
                 Attempt::Ok { status, body, .. } if (200..300).contains(&status) => {
-                    self.inner.rate_limit.on_success();
-                    return Ok(body);
+                    if matches!(kind, Kind::Api)
+                        && method == "POST"
+                        && let Some(error_type) = retryable_method_error(&body)
+                        && attempt < policy.max_retries
+                    {
+                        attempt += 1;
+                        self.inner.retries_total.fetch_add(1, Ordering::Relaxed);
+                        let delay = self.inner.rate_limit.on_throttle(&policy, None);
+                        if delay >= LONG_RETRY_THRESHOLD {
+                            logger.warn(&format!(
+                                "server reported {error_type}; waiting {} before retry {}/{} (shared level {})",
+                                format_retry_wait(delay),
+                                attempt,
+                                policy.max_retries,
+                                self.inner.rate_limit.level(),
+                            ));
+                        }
+                        self.log_retry(
+                            &logger,
+                            RetryLog {
+                                method,
+                                url,
+                                attempt,
+                                delay,
+                                reason: &error_type,
+                                body: &body,
+                            },
+                        );
+                        std::thread::sleep(delay);
+                    } else {
+                        self.inner.rate_limit.on_success();
+                        return Ok(body);
+                    }
                 }
                 Attempt::Ok {
                     status,
@@ -587,6 +618,35 @@ fn truncate(body: &[u8]) -> String {
 
 pub fn retry_after_header(value: &str) -> Option<Duration> {
     retry::parse_retry_after(value, SystemTime::now())
+}
+
+/// A JMAP method-level error (e.g. `serverUnavailable`) rides inside a 2xx
+/// HTTP response, so it is invisible to the HTTP-status retry logic above.
+/// Scans every method response in the envelope (not just the first) for one
+/// classified `Disposition::Retryable` by [`retry::jmap_method_disposition`],
+/// returning its error type so the caller can retry the whole request the
+/// same way it already retries a transient HTTP status.
+fn retryable_method_error(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let responses = value.get("methodResponses")?.as_array()?;
+    for entry in responses {
+        let Some(triple) = entry.as_array() else {
+            continue;
+        };
+        if triple.len() != 3 || triple[0].as_str() != Some("error") {
+            continue;
+        }
+        let Some(error_type) = triple[1].get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if matches!(
+            retry::jmap_method_disposition(error_type),
+            Disposition::Retryable
+        ) {
+            return Some(error_type.to_owned());
+        }
+    }
+    None
 }
 
 fn problem_detail(body: &[u8]) -> Option<String> {

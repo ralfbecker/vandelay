@@ -268,6 +268,54 @@ fn rate_limit_with_retry_after_is_honoured_then_succeeds() {
 }
 
 #[test]
+fn server_unavailable_method_error_is_retried_then_succeeds() {
+    // serverUnavailable rides inside a 200 response as a JMAP method-level
+    // error, unlike an HTTP 503 -- it is invisible to HTTP-status retry logic
+    // and needs its own handling.
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    server
+        .mock("POST", api)
+        .with_status(200)
+        .with_body(json!({"methodResponses":[["error",{"type":"serverUnavailable"},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    server
+        .mock("POST", api)
+        .with_status(200)
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","state":"snap-1",
+                "list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let url = format!("{}{}", server.url(), api);
+    let st = get_state(&client(2), &url, "w", "Email").expect("get_state");
+    assert_eq!(st.as_deref(), Some("snap-1"));
+}
+
+#[test]
+fn server_unavailable_method_error_exhausts_retries_and_surfaces_as_method_error() {
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    server
+        .mock("POST", api)
+        .with_status(200)
+        .with_body(json!({"methodResponses":[["error",{"type":"serverUnavailable"},"g"]]}).to_string())
+        .expect(2)
+        .create();
+
+    let url = format!("{}{}", server.url(), api);
+    let err = get_state(&client(1), &url, "w", "Email").unwrap_err();
+    assert!(
+        matches!(err, JmapError::Method { ref error_type, .. } if error_type == "serverUnavailable"),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn server_unavailable_503_is_retried() {
     let mut server = mockito::Server::new();
     let api = "/jmap/api";
