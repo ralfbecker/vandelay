@@ -498,12 +498,14 @@ mod common {
     /// list (sequential, anchor-based pagination), then their contents
     /// (parallel `Type/get` chunks). For a target with hundreds of thousands
     /// of objects already on it, the id-listing pagination alone can run for
-    /// minutes, so both halves report progress rather than only the second
-    /// — otherwise a long-running phase looks frozen for the entire first
-    /// half. The target's own count does not necessarily match whatever
-    /// total the caller's active progress phase was started with (e.g. the
-    /// local row count), so this is a liveliness signal, not a precise
-    /// percentage.
+    /// minutes with nothing else to show for it, so that half reports
+    /// progress so the phase does not look frozen. The following fetch does
+    /// not: it walks the exact same ids a second time, so counting both
+    /// would double-count every target object against the caller's phase
+    /// total, on top of that total already having no necessary relation to
+    /// the target's own count (e.g. the local row count the phase started
+    /// with). One approximate liveliness signal per object is enough; two
+    /// is actively misleading.
     pub fn target_query_get(
         net: &Net,
         ty: ObjectType,
@@ -521,9 +523,7 @@ mod common {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        get_objects_parallel(net, ty, &ids, props, threads, |n| {
-            crate::progress::advance(n as u64)
-        })
+        get_objects_parallel(net, ty, &ids, props, threads, |_| {})
     }
 
     /// Fetches `ids` in parallel chunks bounded by the server's advertised
