@@ -106,4 +106,10 @@ fn report(summary: &Summary) {
             counts.failed
         );
     }
+    if summary.retries_observed > 0 {
+        println!(
+            "retries: {} ({} after a server Retry-After/backoff wait)",
+            summary.retries_observed, summary.retry_after_sleeps
+        );
+    }
 }
