@@ -949,6 +949,62 @@ fn coordinator_acl_getacl_failure_for_one_folder_continues() {
 }
 
 #[test]
+fn coordinator_acl_getacl_failure_on_noselect_folder_is_not_fatal() {
+    let control: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN ACL")?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LIST \"\" \"*\"");
+        conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+        // A shared-namespace root: present on the server (kept in the
+        // resolved list so it is not mistaken for vanished), but not a real
+        // addressable mailbox, so GETACL against it fails.
+        conn.write_line("* LIST (\\Noselect) \"/\" \"user\"")?;
+        conn.write_line(&format!("{tag} OK LIST done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LSUB \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        // Same-depth folders are visited in name order ("INBOX" < "user").
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "GETACL \"INBOX\"");
+        conn.write_line("* ACL \"INBOX\" jdoe lr")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "GETACL \"user\"");
+        conn.write_line(&format!(
+            "{tag} NO [NONEXISTENT] Mailbox doesn't exist: user"
+        ))?;
+        // No SELECT for "user": it is \Noselect.
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "SELECT \"INBOX\"");
+        write_select(conn, &tag, 100, 1, 0)?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "UID SEARCH ALL");
+        conn.write_line("* SEARCH")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        drain_until_close(conn);
+        Ok(())
+    });
+    let server = MockImap::start_scripts(vec![control]);
+    let archive = tempfile("acl_noselect_getacl_failure");
+    let summary = run_import(&server, "alice", archive.clone(), |c| c.acl = true).expect("import");
+    let acl_counts = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "mailbox_acl")
+        .unwrap();
+    assert_eq!(acl_counts.1.updated, 1, "INBOX succeeded");
+    assert_eq!(
+        acl_counts.1.failed, 0,
+        "a GETACL failure on a non-selectable folder must not count as failed"
+    );
+    assert_eq!(acl_counts.1.skipped, 1, "\"user\" GETACL was skipped");
+    assert!(
+        !summary.any_failed(),
+        "a benign GETACL failure on a non-selectable folder should not fail the run"
+    );
+}
+
+#[test]
 fn coordinator_acl_rerun_replaces_wholesale() {
     fn control_script(reply: &'static str) -> Script {
         Box::new(move |conn: &mut MockConn| -> std::io::Result<()> {

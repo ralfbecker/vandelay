@@ -475,12 +475,32 @@ fn fetch_acls(
         let resp = match control_run_collect(client, control_ctx, &command::getacl(&wire_name)) {
             Ok(r) => r,
             Err(e) => {
-                log_at(
-                    logger,
-                    LEVEL_DEFAULT,
-                    &format!("folder {:?}: GETACL failed: {e}", folder.name),
-                );
-                counts.failed += 1;
+                if folder.selectable {
+                    log_at(
+                        logger,
+                        LEVEL_DEFAULT,
+                        &format!("folder {:?}: GETACL failed: {e}", folder.name),
+                    );
+                    counts.failed += 1;
+                } else {
+                    // A \Noselect folder is kept in the resolved list so it
+                    // isn't mistaken for vanished (see ResolvedFolder), but
+                    // some servers report GETACL-worthy hierarchy containers
+                    // and pure namespace-prefix placeholders identically at
+                    // LIST time; only the former reliably has an ACL. A
+                    // GETACL failure here is expected often enough (e.g. a
+                    // shared-namespace root like "user") not to count as a
+                    // real failure.
+                    log_at(
+                        logger,
+                        LEVEL_PROGRESS,
+                        &format!(
+                            "folder {:?}: GETACL failed on non-selectable folder, skipping: {e}",
+                            folder.name
+                        ),
+                    );
+                    counts.skipped += 1;
+                }
                 continue;
             }
         };
