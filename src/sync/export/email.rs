@@ -829,6 +829,17 @@ fn account(
             }
         }
         Ok(SingleImport::Skipped) => counts.skipped += 1,
+        // The source blob itself is not a valid RFC 5322 message -- no retry
+        // or reimport will ever fix that, and the only real remedy (deleting
+        // it) has the same end state as leaving it out, so this is not
+        // treated as a run failure.
+        Ok(SingleImport::NotCreated { error_type, detail }) if error_type == "invalidEmail" => {
+            logger.warn(&format!(
+                "Email/import {} ({}) skipped: not a valid RFC 5322 message: {detail}",
+                res.cid, res.hint
+            ));
+            counts.skipped += 1;
+        }
         Ok(SingleImport::NotCreated { detail, .. }) => {
             logger.warn(&format!(
                 "Email/import {} ({}) failed: {detail}",
@@ -1044,5 +1055,41 @@ mod tests {
         assert_eq!(import_workers(16, &limits, true), 16);
         assert_eq!(import_workers(16, &limits, false), 2);
         assert_eq!(import_workers(4, &limits, true), 4);
+    }
+
+    fn not_created(error_type: &str) -> ImportResult {
+        ImportResult {
+            cid: "e1".to_string(),
+            hint: "no message-id, 2 B".to_string(),
+            outcome: Ok(SingleImport::NotCreated {
+                error_type: error_type.to_string(),
+                detail: "Blob does not contain a valid RFC 5322 message.".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn invalid_email_is_skipped_not_failed() {
+        let mut counts = TypeCounts::default();
+        let logger = Logger::new(0);
+        let mut to_cache = Vec::new();
+        account(not_created("invalidEmail"), &mut counts, &logger, &mut to_cache);
+        assert_eq!(counts.skipped, 1);
+        assert_eq!(counts.failed, 0);
+    }
+
+    #[test]
+    fn other_not_created_reasons_still_count_as_failed() {
+        let mut counts = TypeCounts::default();
+        let logger = Logger::new(0);
+        let mut to_cache = Vec::new();
+        account(
+            not_created("someOtherError"),
+            &mut counts,
+            &logger,
+            &mut to_cache,
+        );
+        assert_eq!(counts.skipped, 0);
+        assert_eq!(counts.failed, 1);
     }
 }
