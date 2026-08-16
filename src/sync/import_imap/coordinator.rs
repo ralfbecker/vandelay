@@ -418,9 +418,14 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     )
     .map_err(|e| Error::Connection(format!("worker pool: {e}")))?;
 
+    let mut interrupted = false;
     for (i, folder) in resolved.iter().filter(|f| f.selectable).enumerate() {
         if i > 0 {
             let _ = control_run_collect(&mut client, &control_ctx, "NOOP");
+        }
+        if crate::interrupt::requested() {
+            interrupted = true;
+            break;
         }
         match reconcile_folder(
             &mut conn,
@@ -432,6 +437,13 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
             &mut email_counts,
         ) {
             Ok(()) => {}
+            // Stop entirely rather than count it as this one folder's
+            // failure and move on to the next -- that would defeat the
+            // point of checking for a shutdown request in the first place.
+            Err(Error::Interrupted) => {
+                interrupted = true;
+                break;
+            }
             Err(e) => {
                 log_at(
                     logger,
@@ -445,6 +457,10 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
 
     pool.shutdown();
     let _ = client.logout();
+
+    if interrupted {
+        return Err(Error::Interrupted);
+    }
 
     Ok(Summary {
         per_type: vec![
@@ -882,7 +898,12 @@ fn reconcile_folder(
             uidvalidity,
             mailbox_local,
         };
-        while chunks_done < n_batches {
+        // Stop draining and commit whatever's already been inserted once
+        // interrupted, rather than let an uncommitted transaction roll back
+        // and lose messages already fetched -- background workers may keep
+        // processing already-queued jobs briefly, but nothing further gets
+        // committed once we stop here.
+        while chunks_done < n_batches && !crate::interrupt::requested() {
             let event = loop {
                 match pool.recv_timeout(keepalive_interval) {
                     Ok(r) => break r,
@@ -916,7 +937,11 @@ fn reconcile_folder(
                 }
             }
         }
+        let interrupted = chunks_done < n_batches;
         tx.commit()?;
+        if interrupted {
+            return Err(Error::Interrupted);
+        }
     }
 
     if !diff.present.is_empty() {

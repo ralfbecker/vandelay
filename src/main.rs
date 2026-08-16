@@ -9,6 +9,7 @@ use clap::Parser;
 use vandelay::cli::{Action, Cli};
 use vandelay::error::Error;
 use vandelay::inspect;
+use vandelay::interrupt;
 use vandelay::sync::{self, Summary};
 
 fn main() {
@@ -17,6 +18,8 @@ fn main() {
 }
 
 fn run() -> i32 {
+    interrupt::install();
+
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {

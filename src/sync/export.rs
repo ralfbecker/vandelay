@@ -166,6 +166,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
     let mut plans: HashMap<ObjectType, Plan> = HashMap::new();
     let mut counts_per_type: HashMap<ObjectType, TypeCounts> = HashMap::new();
 
+    let mut interrupted = false;
     for ty in &work {
         if logger.enabled(LEVEL_DEFAULT) {
             eprintln!("export: {} ...", ty.jmap_name());
@@ -183,6 +184,13 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         );
         let plan = match res {
             Ok(p) => p,
+            // Stop entirely rather than count it as this one type's failure
+            // and move on to the next -- and skip prune below, since it
+            // would act on an incomplete/inconsistent plan for this type.
+            Err(Error::Interrupted) => {
+                interrupted = true;
+                Plan::default()
+            }
             Err(e) => {
                 logger.warn(&format!("type {} aborted: {e}", ty.jmap_name()));
                 counts.failed += 1;
@@ -192,6 +200,13 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         crate::progress::finish();
         plans.insert(*ty, plan);
         counts_per_type.insert(*ty, counts);
+        if interrupted {
+            break;
+        }
+    }
+
+    if interrupted {
+        return Err(Error::Interrupted);
     }
 
     let acl_counts = if config.acl {

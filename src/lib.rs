@@ -13,6 +13,7 @@ pub mod exchange_ews;
 pub mod exchange_graph;
 pub mod imap;
 pub mod inspect;
+pub mod interrupt;
 pub mod jmap;
 pub mod logging;
 pub mod managesieve;

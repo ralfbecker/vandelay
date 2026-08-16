@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("interrupted by user; the archive is consistent and resumable")]
+    Interrupted,
 }
 
 impl From<rusqlite::Error> for Error {
@@ -54,6 +57,9 @@ impl Error {
             Error::Unimplemented(_) => 1,
             Error::Db(_) => 7,
             Error::Io(_) => 7,
+            // matches the conventional Unix "killed by signal N" exit code
+            // (128+SIGINT), rather than colliding with the 1..7 range above.
+            Error::Interrupted => 130,
         }
     }
 }
@@ -73,5 +79,6 @@ mod tests {
         assert_eq!(Error::PruneAborted.exit_code(), 6);
         let io = Error::Io(std::io::Error::other("disk"));
         assert_eq!(io.exit_code(), 7);
+        assert_eq!(Error::Interrupted.exit_code(), 130);
     }
 }

@@ -35,6 +35,7 @@ thiserror  = "2.0.18"
 ureq = { version = "3.3.0", default-features = false, features = ["json", "gzip", "rustls-no-provider", "platform-verifier"] }
 clap = { version = "4.6.1", features = ["derive"] }
 crossbeam-channel = "0.5.15"
+ctrlc = { version = "3.4", features = ["termination"] }
 num_cpus = "1.17.0"
 base64 = "0.22.1"
 mail-parser = "0.11.3"

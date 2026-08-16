@@ -393,8 +393,17 @@ fn create_missing(
     let mut in_flight = 0usize;
     let mut batch: Vec<ImportJob> = Vec::new();
     let mut batch_encoded = 0usize;
+    let mut interrupted = false;
 
     for (local_id, row) in to_create {
+        // Stop submitting *new* batches once interrupted, but still fall
+        // through to the same submit/finish/flush below as a normal
+        // completion -- so whatever's already in flight gets its results
+        // cached before this returns, rather than dropped.
+        if crate::interrupt::requested() {
+            interrupted = true;
+            break;
+        }
         let job = match prepare_job(ctx, maps, *local_id, row, counts, logger) {
             Some(j) => j,
             None => {
@@ -438,6 +447,9 @@ fn create_missing(
     )?;
     for batch in pool.finish() {
         flush_results(ctx, target_row, ty, batch, counts, logger)?;
+    }
+    if interrupted {
+        return Err(Error::Interrupted);
     }
     Ok(())
 }
