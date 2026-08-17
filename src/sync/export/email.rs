@@ -642,26 +642,29 @@ fn run_batch(net: &Net, cache: &BlobCache, jobs: Vec<ImportJob>) -> Vec<ImportRe
     };
 
     // A staged blob can expire between the upload and the import when the
-    // server throttles in between. Those go back through the per-message path,
-    // which re-uploads before retrying.
-    let stale: HashSet<String> = results
+    // server throttles in between, or the import can fail with a transient
+    // serverUnavailable. Both go back through the per-message path, which
+    // re-uploads (blobNotFound) or just retries the same import once
+    // (serverUnavailable) before giving up -- see run_import.
+    let retry: HashSet<String> = results
         .iter()
-        .filter(|r| is_blob_not_found(r))
+        .filter(|r| is_retryable_not_created(r))
         .map(|r| r.cid.clone())
         .collect();
     let mut redo = throttled;
-    if !stale.is_empty() {
-        results.retain(|r| !stale.contains(&r.cid));
-        redo.extend(uploaded.into_iter().filter(|j| stale.contains(&j.cid)));
+    if !retry.is_empty() {
+        results.retain(|r| !retry.contains(&r.cid));
+        redo.extend(uploaded.into_iter().filter(|j| retry.contains(&j.cid)));
     }
     results.extend(per_message(net, cache, redo));
     results
 }
 
-fn is_blob_not_found(res: &ImportResult) -> bool {
+fn is_retryable_not_created(res: &ImportResult) -> bool {
     matches!(
         &res.outcome,
-        Ok(SingleImport::NotCreated { error_type, .. }) if error_type == "blobNotFound"
+        Ok(SingleImport::NotCreated { error_type, .. })
+            if error_type == "blobNotFound" || error_type == "serverUnavailable"
     )
 }
 
@@ -786,6 +789,17 @@ fn run_import(net: &Net, cache: &BlobCache, job: &ImportJob) -> Result<SingleImp
         SingleImport::NotCreated { ref error_type, .. } if error_type == "blobNotFound" => {
             invalidate(cache, job.blob_local_id, &blob);
             let blob = upload_cached(net, cache, job.blob_local_id, &job.bytes)?;
+            let item = import_item(
+                blob.0,
+                job.mids.clone(),
+                job.keywords.clone(),
+                &job.received_at,
+            );
+            send_single_import(net, &job.cid, item)
+        }
+        // Transient server-side condition, not a stale blob reference -- no
+        // re-upload needed, just retry the same import once.
+        SingleImport::NotCreated { ref error_type, .. } if error_type == "serverUnavailable" => {
             let item = import_item(
                 blob.0,
                 job.mids.clone(),
@@ -1103,5 +1117,17 @@ mod tests {
         );
         assert_eq!(counts.skipped, 0);
         assert_eq!(counts.failed, 1);
+    }
+
+    #[test]
+    fn blob_not_found_and_server_unavailable_are_retryable() {
+        assert!(is_retryable_not_created(&not_created("blobNotFound")));
+        assert!(is_retryable_not_created(&not_created("serverUnavailable")));
+    }
+
+    #[test]
+    fn other_not_created_reasons_are_not_retryable() {
+        assert!(!is_retryable_not_created(&not_created("invalidEmail")));
+        assert!(!is_retryable_not_created(&not_created("someOtherError")));
     }
 }
