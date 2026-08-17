@@ -4602,8 +4602,17 @@ fn mock_matched_inbox(server: &mut mockito::Server, api: &str) -> (mockito::Mock
     (mq, _mq_end, mg)
 }
 
+/// Confirmed against a live Stalwart server: it accepts and applies
+/// Mailbox/set shareWith writes (and resolves Principal/query fine) despite
+/// never listing urn:ietf:params:jmap:mail:share or urn:ietf:params:jmap:
+/// principals in its session object at all -- so --acl export must not
+/// pre-emptively skip based on what the session advertises. This uses the
+/// plain (capability-free) session_body but otherwise the same successful
+/// Principal/query + Mailbox/get(shareWith) + Mailbox/set mocks as
+/// export_acl_pushes_share_with_computed_from_imap_rights, to prove the
+/// export still goes through and succeeds.
 #[test]
-fn export_acl_skips_when_target_lacks_sharing_capabilities() {
+fn export_acl_proceeds_even_when_target_does_not_advertise_sharing_capabilities() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
@@ -4619,7 +4628,7 @@ fn export_acl_skips_when_target_lacks_sharing_capabilities() {
         db::acls::replace_for_mailbox(
             &conn,
             1,
-            &[("jdoe@example.com".to_owned(), "lr".to_owned())],
+            &[("jdoe@example.com".to_owned(), "lrswikta".to_owned())],
         )
         .unwrap();
     }
@@ -4630,11 +4639,39 @@ fn export_acl_skips_when_target_lacks_sharing_capabilities() {
         // The plain session_body has no mail:share / principals capability.
         .with_body(session_body(&base))
         .create();
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
     let _pq = server
         .mock("POST", api)
         .match_body(Matcher::Regex("Principal/query".into()))
-        .with_body(json!({"methodResponses":[]}).to_string())
-        .expect(0)
+        .with_body(
+            json!({"methodResponses":[
+                ["Principal/query", {"accountId":"w","ids":["p1"]}, "q0"],
+                ["Principal/get", {"accountId":"w",
+                    "list":[{"id":"p1","email":"jdoe@example.com"}],"notFound":[]}, "g0"]
+            ]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _current = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("shareWith".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",
+                {"accountId":"w","list":[{"id":"t1","shareWith":null}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/set".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",
+                {"accountId":"w","updated":{"t1":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
         .create();
 
     let summary = sync::export::run(
@@ -4652,9 +4689,8 @@ fn export_acl_skips_when_target_lacks_sharing_capabilities() {
         .iter()
         .find(|(k, _)| *k == "mailbox_acl")
         .unwrap();
-    assert_eq!(acl_counts.1.updated, 0);
+    assert_eq!(acl_counts.1.updated, 1);
     assert_eq!(acl_counts.1.failed, 0);
-    _pq.assert();
     let _ = std::fs::remove_file(&archive);
 }
 

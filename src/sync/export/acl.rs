@@ -20,7 +20,6 @@ use crate::types::ObjectType;
 use super::{Maps, Net};
 
 const MAIL_SHARE_URN: &str = "urn:ietf:params:jmap:mail:share";
-const PRINCIPALS_URN: &str = "urn:ietf:params:jmap:principals";
 
 /// Internal rights bitset mirroring Stalwart's `types::acl::Acl` (the subset
 /// relevant to Mailbox sharing). Derived directly from Stalwart's own source
@@ -100,15 +99,14 @@ pub fn export(ctx: &Context, net: &Net, maps: &Maps, logger: &Logger) -> TypeCou
         return counts;
     }
 
-    if !net.session.supports(&net.account, MAIL_SHARE_URN)
-        || !net.session.capabilities.contains_key(PRINCIPALS_URN)
-    {
-        logger.warn(&format!(
-            "target does not support {MAIL_SHARE_URN} / {PRINCIPALS_URN}; --acl export skipped"
-        ));
-        return counts;
-    }
-
+    // Deliberately not gated on the session advertising mail:share /
+    // principals: confirmed against a live Stalwart server that it accepts
+    // and applies Mailbox/set shareWith writes (and Principal/query
+    // resolves fine) despite never listing urn:ietf:params:jmap:mail:share
+    // in .well-known/jmap at all -- the advertised capability list can't be
+    // trusted here. If a target genuinely doesn't support this, the calls
+    // below fail on their own and are handled the same way as any other
+    // read/write failure.
     let rows = match db::acls::all(&ctx.conn) {
         Ok(r) => r,
         Err(e) => {
