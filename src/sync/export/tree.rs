@@ -203,9 +203,11 @@ fn find_name_collision(
         .map(|t| t.id.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_merge(
     ty: ObjectType,
     local: i64,
+    name: &str,
     target_id: String,
     reason: &str,
     maps: &mut Maps,
@@ -213,7 +215,7 @@ fn record_merge(
     logger: &Logger,
 ) {
     logger.warn(&format!(
-        "{} local {local} merged into existing target {target_id}: {reason}",
+        "{} {name:?} local {local} merged into existing target {target_id}: {reason}",
         ty.jmap_name()
     ));
     maps.insert(ty, local, JmapId(target_id.clone()));
@@ -285,6 +287,7 @@ pub fn reconcile(
                     record_merge(
                         ty,
                         n.local,
+                        &n.name,
                         tid,
                         "name already present on target",
                         maps,
@@ -346,9 +349,15 @@ pub fn reconcile(
                 for (cid, err) in &outcome.not_created {
                     let local = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok());
                     if let (Some(local), Some(existing)) = (local, already_exists_id(err)) {
+                        let name = level
+                            .iter()
+                            .find(|n| n.local == local)
+                            .map(|n| n.name.as_str())
+                            .unwrap_or("?");
                         record_merge(
                             ty,
                             local,
+                            name,
                             existing,
                             "alreadyExists: reusing existing target",
                             maps,
@@ -388,6 +397,7 @@ pub fn reconcile(
                 record_merge(
                     ty,
                     n.local,
+                    &n.name,
                     tid,
                     "name already present on target",
                     maps,
@@ -443,9 +453,15 @@ pub fn reconcile(
             for (cid, err) in &outcome.not_created {
                 let local = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok());
                 if let (Some(local), Some(existing)) = (local, already_exists_id(err)) {
+                    let name = level
+                        .iter()
+                        .find(|n| n.local == local)
+                        .map(|n| n.name.as_str())
+                        .unwrap_or("?");
                     record_merge(
                         ty,
                         local,
+                        name,
                         existing,
                         "alreadyExists: reusing existing target",
                         maps,
@@ -473,6 +489,7 @@ pub fn reconcile(
     // `targets`, since it didn't exist yet, so build_create already got it
     // right and there's nothing to redo.
     if ty == ObjectType::Mailbox && !net.dry_run {
+        let subscribed_word = |s: bool| if s { "subscribed" } else { "unsubscribed" };
         let target_subscribed: HashMap<&str, bool> = targets
             .iter()
             .map(|t| (t.id.as_str(), t.is_subscribed))
@@ -482,11 +499,36 @@ pub fn reconcile(
             let Some(target_id) = maps.target(ty, n.local) else {
                 continue;
             };
-            let Some(&current) = target_subscribed.get(target_id.0.as_str()) else {
-                continue;
-            };
-            if current != n.is_subscribed {
-                resub.push((target_id.0, n.is_subscribed));
+            match target_subscribed.get(target_id.0.as_str()) {
+                // Not in target_subscribed => this target id didn't exist
+                // when `targets` was loaded, so it was created fresh in this
+                // run -- build_create already set isSubscribed correctly.
+                None => {
+                    logger.warn(&format!(
+                        "Mailbox {:?} ({}): created, subscription set to {}",
+                        n.name,
+                        target_id.0,
+                        subscribed_word(n.is_subscribed)
+                    ));
+                }
+                Some(&current) if current == n.is_subscribed => {
+                    logger.warn(&format!(
+                        "Mailbox {:?} ({}): merged, subscription already correct ({})",
+                        n.name,
+                        target_id.0,
+                        subscribed_word(n.is_subscribed)
+                    ));
+                }
+                Some(&current) => {
+                    logger.warn(&format!(
+                        "Mailbox {:?} ({}): merged, subscription {} -> {}",
+                        n.name,
+                        target_id.0,
+                        subscribed_word(current),
+                        subscribed_word(n.is_subscribed)
+                    ));
+                    resub.push((target_id.0, n.is_subscribed));
+                }
             }
         }
         for chunk in resub.chunks(chunk_size(&net.limits)) {
