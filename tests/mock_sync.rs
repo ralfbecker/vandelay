@@ -103,7 +103,7 @@ fn export_email_already_exists_is_matched_not_failed() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
             {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+             "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect(1)
@@ -236,7 +236,7 @@ fn export_mailbox_name_collision_merges_without_create() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
             {"id":"c","name":"Junk Mail","role":"junk","parentId":null,
-             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+             "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect(1)
@@ -332,6 +332,129 @@ fn export_mailbox_name_collision_merges_without_create() {
     let _ = std::fs::remove_file(&archive);
 }
 
+/// A matched (not created) mailbox is otherwise left exactly as it already
+/// is on the target -- only build_create sets isSubscribed, so a mailbox
+/// matched by role against a pre-existing target keeps whatever
+/// subscription state the target happened to have (here: false, e.g. an
+/// auto-provisioned account default) instead of the source's. This is what
+/// caused a real migration to come out with every folder unsubscribed on
+/// Stalwart except the handful the target had already provisioned by role.
+#[test]
+fn export_mailbox_role_matched_syncs_mismatched_subscription() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Junk',NULL,'junk')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    let _mq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":["c"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            {"id":"c","name":"Junk","role":"junk","parentId":null,
+             "myRights":{"mayDelete":true},"isSubscribed":false}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+    let _set = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/set".into()),
+            Matcher::Regex(r#""c":\{"isSubscribed":true\}"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",
+            {"accountId":"w","updated":{"c":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .create();
+
+    let summary = sync::export::run(
+        CommonConfig {
+            archive: archive.clone(),
+            threads: 1,
+            dry_run: false,
+            max_retries: 1,
+            allow_invalid_certs: false,
+            logger: Logger::from_flags(true, 0),
+        },
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+            acl: false,
+            assume_not_deleted_in_destination: false,
+        },
+    )
+    .expect("export run");
+
+    let mailbox = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("mailbox counts");
+    assert_eq!(mailbox.created, 0, "role match, no create");
+    assert_eq!(mailbox.updated, 1, "isSubscribed mismatch synced");
+    assert_eq!(mailbox.failed, 0);
+    assert!(!summary.any_failed());
+
+    let _ = std::fs::remove_file(&archive);
+}
+
 #[test]
 fn export_mailbox_already_exists_maps_existing_id() {
     let mut server = mockito::Server::new();
@@ -391,7 +514,7 @@ fn export_mailbox_already_exists_maps_existing_id() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
             {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+             "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect(1)
@@ -553,7 +676,7 @@ fn email_export_sends_one_email_per_import_call() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
                 {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+                 "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect_at_least(1)
@@ -705,7 +828,7 @@ fn export_email_blob_not_found_reuploads_and_retries() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
             {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+             "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect(1)
@@ -870,7 +993,7 @@ fn export_email_parallel_imports_each_email() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
                 {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+                 "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect_at_least(1)
@@ -1007,7 +1130,7 @@ fn export_email_parallel_thousand_emails() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
                 {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+                 "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect_at_least(1)
@@ -1715,7 +1838,7 @@ fn export_email_parallel_blob_not_found_self_heals() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
             {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+             "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect_at_least(1)
@@ -2552,7 +2675,7 @@ fn export_missing_target_email_is_created_on_rerun() {
         .match_body(Matcher::Regex("Mailbox/get".into()))
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
-                {"id":"T1","name":"Inbox","role":"inbox","parentId":null,"myRights":{"mayDelete":true}}
+                {"id":"T1","name":"Inbox","role":"inbox","parentId":null,"myRights":{"mayDelete":true},"isSubscribed":true}
             ],"notFound":[]},"g"]]})
             .to_string(),
         )
@@ -2668,7 +2791,7 @@ fn export_email_blake3_fallback_matches_when_no_message_id() {
         .match_body(Matcher::Regex("Mailbox/get".into()))
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
-                {"id":"T1","name":"Inbox","role":"inbox","parentId":null,"myRights":{"mayDelete":true}}
+                {"id":"T1","name":"Inbox","role":"inbox","parentId":null,"myRights":{"mayDelete":true},"isSubscribed":true}
             ],"notFound":[]},"g"]]})
             .to_string(),
         )
@@ -4239,8 +4362,8 @@ fn export_duplicate_role_mailbox_created_as_plain_folder_keeping_subtree() {
         .match_body(Matcher::Regex("Mailbox/get".into()))
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
-                {"id":"TI","name":"Inbox","role":"inbox","parentId":null,"myRights":{"mayDelete":true}},
-                {"id":"TS","name":"Sent","role":"sent","parentId":null,"myRights":{"mayDelete":true}}
+                {"id":"TI","name":"Inbox","role":"inbox","parentId":null,"myRights":{"mayDelete":true},"isSubscribed":true},
+                {"id":"TS","name":"Sent","role":"sent","parentId":null,"myRights":{"mayDelete":true},"isSubscribed":true}
             ],"notFound":[]},"g"]]})
             .to_string(),
         )
@@ -4445,7 +4568,7 @@ fn export_email_batches_blob_upload_when_server_supports_it() {
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
                 {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+                 "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect_at_least(1)
@@ -4594,7 +4717,7 @@ fn mock_matched_inbox(server: &mut mockito::Server, api: &str) -> (mockito::Mock
         .with_body(
             json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
                 {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
-                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+                 "myRights":{"mayDelete":true},"isSubscribed":true}],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect(1)

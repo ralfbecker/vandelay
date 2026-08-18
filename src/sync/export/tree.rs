@@ -7,11 +7,12 @@
 use std::collections::{HashMap, HashSet};
 
 use rusqlite::params;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use super::common::{chunk_size, create_batch, jid, retry_if_blob_missing, target_query_get};
 use super::{Net, Plan, Uploader};
 use crate::error::Error;
+use crate::jmap::request::{SetRequest, set_call};
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{
@@ -28,6 +29,7 @@ struct LocalNode {
     parent: Option<i64>,
     name: String,
     role: Option<String>,
+    is_subscribed: bool,
 }
 
 struct TargetNode {
@@ -36,6 +38,7 @@ struct TargetNode {
     name: String,
     role: Option<String>,
     may_delete: bool,
+    is_subscribed: bool,
 }
 
 /// Result of matching local nodes against whatever already exists on the
@@ -121,7 +124,9 @@ fn load_local(ctx: &Context, ty: ObjectType) -> Result<Vec<LocalNode>, Error> {
     let table = crate::sync::table_name(ty);
     let mut stmt = ctx
         .conn
-        .prepare(&format!("SELECT id, parent_id, name, role FROM {table}"))
+        .prepare(&format!(
+            "SELECT id, parent_id, name, role, is_subscribed FROM {table}"
+        ))
         .map_err(|e| Error::Partial(e.to_string()))?;
     let rows = stmt
         .query_map([], |r| {
@@ -130,6 +135,7 @@ fn load_local(ctx: &Context, ty: ObjectType) -> Result<Vec<LocalNode>, Error> {
                 parent: r.get(1)?,
                 name: r.get(2)?,
                 role: r.get(3)?,
+                is_subscribed: r.get::<_, i64>(4)? != 0,
             })
         })
         .and_then(|m| m.collect::<Result<Vec<_>, _>>())
@@ -138,7 +144,7 @@ fn load_local(ctx: &Context, ty: ObjectType) -> Result<Vec<LocalNode>, Error> {
 }
 
 fn load_target(net: &Net, ty: ObjectType, threads: usize) -> Result<Vec<TargetNode>, Error> {
-    let props: &[&str] = &["role", "name", "parentId", "myRights"];
+    let props: &[&str] = &["role", "name", "parentId", "myRights", "isSubscribed"];
     let list = target_query_get(net, ty, Some(props), threads).map_err(Error::from)?;
     Ok(list
         .iter()
@@ -153,6 +159,10 @@ fn load_target(net: &Net, ty: ObjectType, threads: usize) -> Result<Vec<TargetNo
                     .and_then(|r| r.get("mayDelete"))
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                is_subscribed: v
+                    .get("isSubscribed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect())
@@ -449,6 +459,64 @@ pub fn reconcile(
                 logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
                 counts.failed += 1;
                 crate::progress::advance(1);
+            }
+        }
+    }
+
+    // Matched/merged mailboxes are otherwise left exactly as they already
+    // are on the target -- create is the only path that ever sets
+    // isSubscribed (in build_create), so a mailbox matched against something
+    // that already existed keeps whatever subscription state it happened to
+    // have there instead of the source's. Reconcile that here for any local
+    // mailbox mapped to a target id that was already present when `targets`
+    // was loaded -- a freshly created mailbox's target id never appears in
+    // `targets`, since it didn't exist yet, so build_create already got it
+    // right and there's nothing to redo.
+    if ty == ObjectType::Mailbox && !net.dry_run {
+        let target_subscribed: HashMap<&str, bool> = targets
+            .iter()
+            .map(|t| (t.id.as_str(), t.is_subscribed))
+            .collect();
+        let mut resub: Vec<(String, bool)> = Vec::new();
+        for n in &locals {
+            let Some(target_id) = maps.target(ty, n.local) else {
+                continue;
+            };
+            let Some(&current) = target_subscribed.get(target_id.0.as_str()) else {
+                continue;
+            };
+            if current != n.is_subscribed {
+                resub.push((target_id.0, n.is_subscribed));
+            }
+        }
+        for chunk in resub.chunks(chunk_size(&net.limits)) {
+            let mut update = Map::new();
+            for (id, is_subscribed) in chunk {
+                update.insert(id.clone(), json!({ "isSubscribed": is_subscribed }));
+            }
+            let outcome = set_call(
+                &net.client,
+                &net.api,
+                &net.account,
+                ty.jmap_name(),
+                SetRequest {
+                    update: Some(Value::Object(update)),
+                    ..Default::default()
+                },
+                &net.limits,
+            );
+            match outcome {
+                Ok(outcome) => {
+                    counts.updated += outcome.updated.len() as u64;
+                    for (id, err) in &outcome.not_updated {
+                        logger.warn(&format!("Mailbox {id}: could not sync isSubscribed: {err}"));
+                        counts.failed += 1;
+                    }
+                }
+                Err(e) => {
+                    logger.warn(&format!("Mailbox: syncing isSubscribed failed: {e}"));
+                    counts.failed += 1;
+                }
             }
         }
     }
