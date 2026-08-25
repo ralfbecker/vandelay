@@ -124,6 +124,7 @@ struct Net {
     session: Session,
     dry_run: bool,
     assume_not_deleted_in_destination: bool,
+    prune: bool,
 }
 
 fn count_rows(conn: &Connection, ty: ObjectType) -> Option<u64> {
@@ -157,6 +158,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         session: connected.session.clone(),
         dry_run: ctx.dry_run(),
         assume_not_deleted_in_destination: config.assume_not_deleted_in_destination,
+        prune: config.prune,
     };
 
     let work = work_list(&ctx.conn, &config, &connected, &logger);
