@@ -7,16 +7,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde_json::{Map, Value, json};
 
-use super::common::{get_objects_parallel, jid};
+use super::common::{get_objects_parallel, jid, target_query_get};
 use super::{Maps, Net, Plan, email_batch};
 use crate::db;
 use crate::error::Error;
 use crate::jmap::blobxfer;
 use crate::jmap::error::JmapError;
-use crate::jmap::request::{Request, check_method_error, get_state, query_ids_filtered};
+use crate::jmap::request::{Request, check_method_error, get_state};
 use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
@@ -53,180 +52,6 @@ fn server_index(v: &Value) -> EmailIndex {
         v.get("sentAt").and_then(Value::as_str).unwrap_or(""),
         &arr("to"),
     )
-}
-
-/// Below this a chunk is never split further, whatever it returns: an error
-/// is propagated (the run fails rather than silently under-counting what's
-/// already on the target), a suspicious 0-result count is accepted as real.
-const MIN_CHUNK: Duration = Duration::days(31);
-
-/// Full-rebuild target enumeration for `reconcile`'s slow path
-/// (`target_query_get`'s old caller here), scoped by calendar year instead
-/// of one unfiltered account-wide `Email/query`. An unfiltered query forces
-/// the server's search backend to sort/traverse every email in the account
-/// just to paginate, which trips Meilisearch's `maxTotalHits` cap on
-/// accounts with large single mailboxes (e.g. a mailing-list archive
-/// folder) -- see the memory note `stalwart_email_query_index_bug` for the
-/// related bug this was first noticed alongside. Chunking by year keeps
-/// each query's matched set bounded by what that year actually holds, and
-/// `query_range_adaptive` splits a chunk further (down to `MIN_CHUNK`) if it
-/// still errors or looks suspiciously empty.
-fn target_email_min(
-    net: &Net,
-    local: &[(i64, EmailRow)],
-    threads: usize,
-    logger: &Logger,
-) -> Result<Vec<Value>, JmapError> {
-    let ids = target_email_ids_chunked(net, local, logger)?;
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    get_objects_parallel(
-        net,
-        ObjectType::Email,
-        &ids,
-        Some(&["messageId"]),
-        threads,
-        |_| {},
-    )
-}
-
-/// The local archive's earliest and latest `receivedAt` year, used to bound
-/// the per-year chunks below. `None` if no local row has a parseable date
-/// (e.g. an empty archive), in which case there's nothing to chunk by.
-fn local_year_range(local: &[(i64, EmailRow)]) -> Option<(i32, i32)> {
-    local
-        .iter()
-        .filter_map(|(_, r)| DateTime::parse_from_rfc3339(&r.received_at).ok())
-        .map(|dt| dt.year())
-        .fold(None, |acc: Option<(i32, i32)>, y| {
-            Some(acc.map_or((y, y), |(lo, hi)| (lo.min(y), hi.max(y))))
-        })
-}
-
-fn year_start(year: i32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).single().expect("valid calendar year")
-}
-
-fn target_email_ids_chunked(
-    net: &Net,
-    local: &[(i64, EmailRow)],
-    logger: &Logger,
-) -> Result<Vec<JmapId>, JmapError> {
-    let Some((min_year, max_year)) = local_year_range(local) else {
-        return Ok(Vec::new());
-    };
-    let mut ids = Vec::new();
-    for year in min_year..=max_year {
-        // The oldest and newest chunk are left open-ended on their outer
-        // side, so target-side mail outside the local archive's exact date
-        // span (a stray pre-migration message, or one that landed on the
-        // target after the archive snapshot) is still found rather than
-        // silently excluded from the dedup match.
-        let after = (year != min_year).then(|| year_start(year));
-        let before = (year != max_year).then(|| year_start(year + 1));
-        query_range_adaptive(net, after, before, logger, &mut ids)?;
-    }
-    Ok(ids)
-}
-
-fn now_utc() -> DateTime<Utc> {
-    DateTime::<Utc>::from(std::time::SystemTime::now())
-}
-
-fn effective_bounds(after: Option<DateTime<Utc>>, before: Option<DateTime<Utc>>) -> (DateTime<Utc>, DateTime<Utc>) {
-    (after.unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap()), before.unwrap_or_else(now_utc))
-}
-
-fn is_min_chunk(after: Option<DateTime<Utc>>, before: Option<DateTime<Utc>>) -> bool {
-    let (lo, hi) = effective_bounds(after, before);
-    hi - lo <= MIN_CHUNK
-}
-
-fn date_filter(after: Option<DateTime<Utc>>, before: Option<DateTime<Utc>>) -> Value {
-    let mut m = Map::new();
-    if let Some(a) = after {
-        m.insert("after".to_owned(), Value::String(a.to_rfc3339()));
-    }
-    if let Some(b) = before {
-        m.insert("before".to_owned(), Value::String(b.to_rfc3339()));
-    }
-    Value::Object(m)
-}
-
-fn describe_range(after: Option<DateTime<Utc>>, before: Option<DateTime<Utc>>) -> String {
-    format!(
-        "{}..{}",
-        after.map(|d| d.to_rfc3339()).unwrap_or_else(|| "-inf".to_owned()),
-        before.map(|d| d.to_rfc3339()).unwrap_or_else(|| "now".to_owned()),
-    )
-}
-
-/// Queries one date-range chunk of the target's Email ids, splitting it in
-/// half and recursing when the chunk itself looks untrustworthy: an
-/// `Email/query` error (logged either way, so a maxTotalHits-shaped error
-/// text can be confirmed even though its exact client-visible form isn't
-/// pinned down yet), or -- only when `--prune` is active, since that's the
-/// mode where trusting a false "nothing here" most directly risks acting on
-/// wrong data -- a suspicious 0-result count. Below `MIN_CHUNK` neither
-/// condition splits further: an error propagates (the run fails instead of
-/// silently under-counting) and a 0-result count is accepted as real.
-fn query_range_adaptive(
-    net: &Net,
-    after: Option<DateTime<Utc>>,
-    before: Option<DateTime<Utc>>,
-    logger: &Logger,
-    out: &mut Vec<JmapId>,
-) -> Result<(), JmapError> {
-    let filter = date_filter(after, before);
-    let result = query_ids_filtered(
-        &net.client,
-        &net.api,
-        &net.account,
-        "Email",
-        &net.limits,
-        &filter,
-        |n| crate::progress::advance(n as u64),
-    );
-    let floor = is_min_chunk(after, before);
-    match result {
-        Ok(ids) => {
-            if ids.is_empty() && net.prune && !floor {
-                logger.warn(&format!(
-                    "Email: target query for {} returned 0 results with --prune set; \
-                     splitting to double-check before trusting it",
-                    describe_range(after, before)
-                ));
-                return split_and_recurse(net, after, before, logger, out);
-            }
-            out.extend(ids);
-            Ok(())
-        }
-        Err(e) => {
-            logger.warn(&format!(
-                "Email: target query for {} failed: {e}",
-                describe_range(after, before)
-            ));
-            if floor {
-                Err(e)
-            } else {
-                split_and_recurse(net, after, before, logger, out)
-            }
-        }
-    }
-}
-
-fn split_and_recurse(
-    net: &Net,
-    after: Option<DateTime<Utc>>,
-    before: Option<DateTime<Utc>>,
-    logger: &Logger,
-    out: &mut Vec<JmapId>,
-) -> Result<(), JmapError> {
-    let (lo, hi) = effective_bounds(after, before);
-    let mid = lo + (hi - lo) / 2;
-    query_range_adaptive(net, after, Some(mid), logger, out)?;
-    query_range_adaptive(net, Some(mid), before, logger, out)
 }
 
 /// The batched path creates blobs through a regular method call, so it never
@@ -352,7 +177,8 @@ pub fn reconcile(
         }
     }
 
-    let target_min = target_email_min(net, &local, ctx.common.threads, logger).map_err(Error::from)?;
+    let target_min = target_query_get(net, ty, Some(&["messageId"]), ctx.common.threads)
+        .map_err(Error::from)?;
     let mut indices: Vec<EmailIndex> = target_min.iter().map(server_index).collect();
 
     let fallback_ids: Vec<JmapId> = target_min
@@ -1303,71 +1129,5 @@ mod tests {
     fn other_not_created_reasons_are_not_retryable() {
         assert!(!is_retryable_not_created(&not_created("invalidEmail")));
         assert!(!is_retryable_not_created(&not_created("someOtherError")));
-    }
-
-    fn row_at(received_at: &str) -> (i64, EmailRow) {
-        (
-            0,
-            EmailRow {
-                blob_local_id: 0,
-                received_at: received_at.to_string(),
-                mailbox_locals: Vec::new(),
-                keywords: Vec::new(),
-                message_match: String::new(),
-            },
-        )
-    }
-
-    #[test]
-    fn local_year_range_spans_earliest_to_latest() {
-        let local = vec![
-            row_at("2024-06-01T00:00:00Z"),
-            row_at("2022-01-15T00:00:00Z"),
-            row_at("2026-08-18T19:43:57Z"),
-        ];
-        assert_eq!(local_year_range(&local), Some((2022, 2026)));
-    }
-
-    #[test]
-    fn local_year_range_ignores_unparseable_dates() {
-        let local = vec![row_at("not-a-date"), row_at("2025-01-01T00:00:00Z")];
-        assert_eq!(local_year_range(&local), Some((2025, 2025)));
-    }
-
-    #[test]
-    fn local_year_range_empty_local_is_none() {
-        assert_eq!(local_year_range(&[]), None);
-    }
-
-    #[test]
-    fn date_filter_omits_open_ended_bounds() {
-        let both = date_filter(Some(year_start(2025)), Some(year_start(2026)));
-        assert_eq!(both["after"], "2025-01-01T00:00:00+00:00");
-        assert_eq!(both["before"], "2026-01-01T00:00:00+00:00");
-
-        let oldest_chunk = date_filter(None, Some(year_start(2023)));
-        assert!(oldest_chunk.get("after").is_none());
-        assert_eq!(oldest_chunk["before"], "2023-01-01T00:00:00+00:00");
-
-        let newest_chunk = date_filter(Some(year_start(2026)), None);
-        assert!(newest_chunk.get("before").is_none());
-    }
-
-    #[test]
-    fn a_full_year_is_not_a_min_chunk() {
-        assert!(!is_min_chunk(Some(year_start(2025)), Some(year_start(2026))));
-    }
-
-    #[test]
-    fn a_month_wide_range_is_a_min_chunk() {
-        let start = year_start(2025);
-        assert!(is_min_chunk(Some(start), Some(start + Duration::days(20))));
-    }
-
-    #[test]
-    fn splitting_a_year_lands_on_two_halves_that_cover_it_exactly() {
-        let (lo, hi) = effective_bounds(Some(year_start(2025)), Some(year_start(2026)));
-        let mid = lo + (hi - lo) / 2;
-        assert!(mid > lo && mid < hi);
     }
 }

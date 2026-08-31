@@ -234,42 +234,7 @@ pub fn query_all_ids_with_progress(
 ) -> Result<Vec<JmapId>, JmapError> {
     let mut restarts = 0u32;
     loop {
-        match query_pages(client, api_url, account_id, type_name, limits, None, &mut on_page) {
-            Ok(ids) => return Ok(ids),
-            Err(JmapError::AnchorNotFound) if restarts < 2 => {
-                restarts += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Like `query_all_ids_with_progress`, but scoped by a caller-supplied JMAP
-/// filter object (e.g. an Email `before`/`after` date range) instead of
-/// listing the whole account. Used to keep a single query's matched set
-/// bounded on targets whose full-account `Type/query` would otherwise be too
-/// large for the server's search backend to page through (see
-/// `sync::export::email`'s year-chunked target enumeration).
-pub fn query_ids_filtered(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-    limits: &Limits,
-    filter: &Value,
-    mut on_page: impl FnMut(usize),
-) -> Result<Vec<JmapId>, JmapError> {
-    let mut restarts = 0u32;
-    loop {
-        match query_pages(
-            client,
-            api_url,
-            account_id,
-            type_name,
-            limits,
-            Some(filter),
-            &mut on_page,
-        ) {
+        match query_pages(client, api_url, account_id, type_name, limits, &mut on_page) {
             Ok(ids) => return Ok(ids),
             Err(JmapError::AnchorNotFound) if restarts < 2 => {
                 restarts += 1;
@@ -285,7 +250,6 @@ fn query_pages(
     account_id: &str,
     type_name: &str,
     limits: &Limits,
-    filter: Option<&Value>,
     on_page: &mut impl FnMut(usize),
 ) -> Result<Vec<JmapId>, JmapError> {
     let limit = limits.max_objects_in_get.max(1);
@@ -297,9 +261,6 @@ fn query_pages(
         let mut args = Map::new();
         args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
         args.insert("limit".to_owned(), Value::from(limit));
-        if let Some(f) = filter {
-            args.insert("filter".to_owned(), f.clone());
-        }
         if let Some(a) = &anchor {
             args.insert("anchor".to_owned(), Value::String(a.clone()));
             args.insert("anchorOffset".to_owned(), Value::from(1));
