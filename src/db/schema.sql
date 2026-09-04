@@ -59,11 +59,18 @@ CREATE TABLE IF NOT EXISTS export_targets (
 -- rerun can verify a small set of known ids instead of rebuilding the whole
 -- target-side dedup index from scratch. Never trusted blindly: a rerun
 -- verifies each cached id is still on the target before relying on it.
+-- keywords_synced (Email only) is the JSON array of keywords vandelay last
+-- pushed to the target for this row, so a rerun can tell "the source's
+-- flags changed since we last synced" from a local comparison alone, with
+-- no target-side read. NULL means never recorded (row predates this column,
+-- or was cached by a non-Email type) -- treated as "unchanged" rather than
+-- a retroactive correction, see sync_keywords in export/email.rs.
 CREATE TABLE IF NOT EXISTS export_target_ids (
-    target_id   INTEGER NOT NULL REFERENCES export_targets(id) ON DELETE CASCADE,
-    type_name   TEXT    NOT NULL,
-    local_id    INTEGER NOT NULL,
-    jmap_id     TEXT    NOT NULL,
+    target_id       INTEGER NOT NULL REFERENCES export_targets(id) ON DELETE CASCADE,
+    type_name       TEXT    NOT NULL,
+    local_id        INTEGER NOT NULL,
+    jmap_id         TEXT    NOT NULL,
+    keywords_synced TEXT,
     PRIMARY KEY (target_id, type_name, local_id)
 );
 

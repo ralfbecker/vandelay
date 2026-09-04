@@ -20,6 +20,7 @@ pub fn apply_schema(conn: &Connection) -> Result<(), OpenError> {
     tx.execute_batch(SCHEMA_SQL)?;
     ensure_calendar_events_data_type(&tx)?;
     ensure_export_targets_email_state(&tx)?;
+    ensure_export_target_ids_keywords_synced(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -43,6 +44,21 @@ fn ensure_export_targets_email_state(conn: &Connection) -> Result<(), OpenError>
     let has_column = rows.filter_map(|r| r.ok()).any(|name| name == "email_state");
     if !has_column {
         conn.execute("ALTER TABLE export_targets ADD COLUMN email_state TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn ensure_export_target_ids_keywords_synced(conn: &Connection) -> Result<(), OpenError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(export_target_ids)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let has_column = rows
+        .filter_map(|r| r.ok())
+        .any(|name| name == "keywords_synced");
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE export_target_ids ADD COLUMN keywords_synced TEXT",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -86,5 +102,41 @@ mod tests {
             .filter_map(|r| r.ok())
             .any(|name| name == "email_state");
         assert!(has_column, "email_state column should be added by migration");
+    }
+
+    #[test]
+    fn apply_schema_adds_keywords_synced_column_to_a_pre_existing_export_target_ids_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE export_targets (
+                id            INTEGER PRIMARY KEY,
+                session_url   TEXT    NOT NULL,
+                account_id    TEXT    NOT NULL,
+                UNIQUE (session_url, account_id)
+            );
+            CREATE TABLE export_target_ids (
+                target_id   INTEGER NOT NULL,
+                type_name   TEXT    NOT NULL,
+                local_id    INTEGER NOT NULL,
+                jmap_id     TEXT    NOT NULL,
+                PRIMARY KEY (target_id, type_name, local_id)
+            );",
+        )
+        .unwrap();
+
+        apply_schema(&conn).unwrap();
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(export_target_ids)")
+            .unwrap();
+        let has_column = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == "keywords_synced");
+        assert!(
+            has_column,
+            "keywords_synced column should be added by migration"
+        );
     }
 }

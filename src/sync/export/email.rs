@@ -15,7 +15,7 @@ use crate::db;
 use crate::error::Error;
 use crate::jmap::blobxfer;
 use crate::jmap::error::JmapError;
-use crate::jmap::request::{Request, check_method_error, get_state};
+use crate::jmap::request::{Request, SetRequest, check_method_error, get_state, set_call};
 use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
@@ -54,6 +54,100 @@ fn server_index(v: &Value) -> EmailIndex {
     )
 }
 
+fn normalize_keywords(kw: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = kw.to_vec();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// A matched row needs its keywords pushed to the target when either the
+/// source's (normalized) keywords no longer match what we last synced, or
+/// the message is currently unseen at the source -- reasserted every run
+/// regardless of whether that unseen state itself changed, so a target-side
+/// test read (e.g. clicking a message in webmail) doesn't stick once the
+/// source never actually marked it seen. A row with no recorded baseline
+/// yet (created before this existed, or never previously needed a push) is
+/// treated as unchanged rather than triggering a retroactive correction --
+/// the unseen condition still applies to it on its own.
+fn keywords_need_sync(current_norm: &[String], synced: Option<&Vec<String>>) -> bool {
+    let changed = synced.is_some_and(|s| s.as_slice() != current_norm);
+    let unseen = !current_norm.iter().any(|k| k == "$seen");
+    changed || unseen
+}
+
+/// Pushes an `Email/set` keywords update for every matched row that
+/// [`keywords_need_sync`] flags, then records the pushed keywords as the new
+/// baseline for each row the target actually confirmed updated. Matched
+/// rows that don't need syncing are left untouched -- this is the only place
+/// Email export ever updates something it didn't just create.
+#[allow(clippy::too_many_arguments)]
+fn sync_keywords(
+    ctx: &Context,
+    net: &Net,
+    target_row: i64,
+    ty: ObjectType,
+    matched: &[(i64, &str, &[String])],
+    synced: &HashMap<i64, Vec<String>>,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Result<(), Error> {
+    if net.dry_run {
+        return Ok(());
+    }
+    let mut update = Map::new();
+    let mut by_jmap_id: HashMap<String, (i64, Vec<String>)> = HashMap::new();
+    for (local_id, jmap_id, kw) in matched {
+        let norm = normalize_keywords(kw);
+        if !keywords_need_sync(&norm, synced.get(local_id)) {
+            continue;
+        }
+        let mut obj = Map::new();
+        for k in &norm {
+            obj.insert(k.clone(), Value::Bool(true));
+        }
+        update.insert((*jmap_id).to_owned(), json!({ "keywords": obj }));
+        by_jmap_id.insert((*jmap_id).to_owned(), (*local_id, norm));
+    }
+    if update.is_empty() {
+        return Ok(());
+    }
+    let outcome = match set_call(
+        &net.client,
+        &net.api,
+        &net.account,
+        ty.jmap_name(),
+        SetRequest {
+            update: Some(Value::Object(update)),
+            ..Default::default()
+        },
+        &net.limits,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            logger.warn(&format!("Email: syncing keywords failed: {e}"));
+            counts.failed += by_jmap_id.len() as u64;
+            return Ok(());
+        }
+    };
+    let mut to_persist: Vec<(i64, Vec<String>)> = Vec::new();
+    for jmap_id in &outcome.updated {
+        if let Some((local_id, norm)) = by_jmap_id.get(jmap_id) {
+            counts.updated += 1;
+            to_persist.push((*local_id, norm.clone()));
+        }
+    }
+    for (id, err) in &outcome.not_updated {
+        logger.warn(&format!("Email {id}: could not sync keywords: {err}"));
+        counts.failed += 1;
+    }
+    if !to_persist.is_empty() {
+        db::export_ids::set_keywords_synced_many(&ctx.conn, target_row, &to_persist)
+            .map_err(|e| Error::Partial(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// The batched path creates blobs through a regular method call, so it never
 /// touches the upload endpoint and only `maxConcurrentRequests` applies. The
 /// per-message path uses both and is bound by the smaller of the two.
@@ -79,6 +173,12 @@ struct ImportJob {
 struct ImportResult {
     cid: String,
     hint: String,
+    /// The keywords just sent to `Email/import`, carried through so a
+    /// successful create can record them as the initial `keywords_synced`
+    /// baseline -- otherwise the row would start with none, and a later
+    /// keyword change at the source would never be noticed (see
+    /// `keywords_need_sync`: no baseline reads as "unchanged").
+    keywords: Vec<String>,
     outcome: Result<SingleImport, JmapError>,
 }
 
@@ -114,6 +214,8 @@ pub fn reconcile(
         .map_err(|e| Error::Partial(e.to_string()))?;
     let cached = db::export_ids::all_for_type(&ctx.conn, target_row, ty)
         .map_err(|e| Error::Partial(e.to_string()))?;
+    let synced = db::export_ids::email_synced_keywords(&ctx.conn, target_row)
+        .map_err(|e| Error::Partial(e.to_string()))?;
 
     // Import never revives a local id, so any cache row whose local id is no
     // longer in the archive means that message was deleted at the source
@@ -124,7 +226,7 @@ pub fn reconcile(
 
     if !local.is_empty() {
         if let Some(mut plan) = try_state_proven_fast_path(
-            ctx, net, maps, target_row, ty, &local, &cached, counts, logger,
+            ctx, net, maps, target_row, ty, &local, &cached, &synced, counts, logger,
         )? {
             plan.prune_candidates = prune_candidates;
             plan.prune_local_ids = prune_local_ids;
@@ -144,7 +246,9 @@ pub fn reconcile(
             // once at the very end) specifically to bound how much a crash
             // mid-run can lose to a handful of in-flight batches rather
             // than the whole run.
-            trust_cache_and_create(ctx, net, maps, target_row, ty, &local, &cached, counts, logger)?;
+            trust_cache_and_create(
+                ctx, net, maps, target_row, ty, &local, &cached, &synced, counts, logger,
+            )?;
             record_state_for_next_run(ctx, net, target_row, logger);
             return Ok(Plan {
                 prune_candidates,
@@ -155,7 +259,18 @@ pub fn reconcile(
     }
 
     if !local.is_empty() && local.iter().all(|(id, _)| cached.contains_key(id)) {
-        match try_cached(net, &local, &cached, ctx.common.threads, counts)? {
+        match try_cached(
+            ctx,
+            net,
+            target_row,
+            ty,
+            &local,
+            &cached,
+            &synced,
+            ctx.common.threads,
+            counts,
+            logger,
+        )? {
             Some(mut plan) => {
                 plan.prune_candidates = prune_candidates;
                 plan.prune_local_ids = prune_local_ids;
@@ -222,12 +337,14 @@ pub fn reconcile(
     let local_keys = email_keys(&local_indices);
 
     let mut matched_to_cache: Vec<(i64, String)> = Vec::new();
+    let mut matched_kw: Vec<(i64, &str, &[String])> = Vec::new();
     let mut to_create: Vec<(i64, &EmailRow)> = Vec::new();
     for (i, key) in local_keys.iter().enumerate() {
         if let Some(target_jmap_id) = target_map.get(key) {
             counts.skipped += 1;
             crate::progress::advance(1);
             matched_to_cache.push((local[i].0, target_jmap_id.clone()));
+            matched_kw.push((local[i].0, target_jmap_id.as_str(), local[i].1.keywords.as_slice()));
         } else {
             to_create.push((local[i].0, &local[i].1));
         }
@@ -238,6 +355,11 @@ pub fn reconcile(
         db::export_ids::upsert_many(&ctx.conn, target_row, ty, &matched_to_cache)
             .map_err(|e| Error::Partial(e.to_string()))?;
     }
+    // Must run after the upsert above: a match found by this full rebuild
+    // (rather than recovered from a prior run's cache) has no
+    // `export_target_ids` row yet, and `sync_keywords`'s baseline update is
+    // an UPDATE, not an upsert -- it needs that row to already exist.
+    sync_keywords(ctx, net, target_row, ty, &matched_kw, &synced, counts, logger)?;
     record_state_for_next_run(ctx, net, target_row, logger);
 
     Ok(Plan {
@@ -267,6 +389,7 @@ fn try_state_proven_fast_path(
     ty: ObjectType,
     local: &[(i64, EmailRow)],
     cached: &HashMap<i64, String>,
+    synced: &HashMap<i64, Vec<String>>,
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<Option<Plan>, Error> {
@@ -297,7 +420,9 @@ fn try_state_proven_fast_path(
             .map_err(|e| Error::Partial(e.to_string()))?;
     }
 
-    trust_cache_and_create(ctx, net, maps, target_row, ty, local, cached, counts, logger)?;
+    trust_cache_and_create(
+        ctx, net, maps, target_row, ty, local, cached, synced, counts, logger,
+    )?;
     record_state_for_next_run(ctx, net, target_row, logger);
 
     Ok(Some(Plan::default()))
@@ -338,18 +463,22 @@ fn trust_cache_and_create(
     ty: ObjectType,
     local: &[(i64, EmailRow)],
     cached: &HashMap<i64, String>,
+    synced: &HashMap<i64, Vec<String>>,
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<(), Error> {
     let mut to_create: Vec<(i64, &EmailRow)> = Vec::new();
+    let mut matched: Vec<(i64, &str, &[String])> = Vec::new();
     for (local_id, row) in local {
-        if cached.contains_key(local_id) {
+        if let Some(jmap_id) = cached.get(local_id) {
             counts.skipped += 1;
             crate::progress::advance(1);
+            matched.push((*local_id, jmap_id.as_str(), row.keywords.as_slice()));
         } else {
             to_create.push((*local_id, row));
         }
     }
+    sync_keywords(ctx, net, target_row, ty, &matched, synced, counts, logger)?;
     create_missing(ctx, net, maps, target_row, ty, &to_create, counts, logger)
 }
 
@@ -505,12 +634,18 @@ pub fn forget_destroyed(
 /// whole size. Returns `Ok(None)` if any cached id turns out stale, so the
 /// caller falls back to the full rebuild rather than silently trusting a
 /// cache that may no longer reflect the target's real state.
+#[allow(clippy::too_many_arguments)]
 fn try_cached(
+    ctx: &Context,
     net: &Net,
+    target_row: i64,
+    ty: ObjectType,
     local: &[(i64, EmailRow)],
     cached: &HashMap<i64, String>,
+    synced: &HashMap<i64, Vec<String>>,
     threads: usize,
     counts: &mut TypeCounts,
+    logger: &Logger,
 ) -> Result<Option<Plan>, Error> {
     let ids: Vec<JmapId> = local
         .iter()
@@ -523,6 +658,11 @@ fn try_cached(
     if found.len() != ids.len() {
         return Ok(None);
     }
+    let matched: Vec<(i64, &str, &[String])> = local
+        .iter()
+        .map(|(local_id, row)| (*local_id, cached[local_id].as_str(), row.keywords.as_slice()))
+        .collect();
+    sync_keywords(ctx, net, target_row, ty, &matched, synced, counts, logger)?;
     for _ in local {
         counts.skipped += 1;
     }
@@ -580,7 +720,23 @@ fn flush_results(
     if to_cache.is_empty() {
         return Ok(());
     }
-    db::export_ids::upsert_many(&ctx.conn, target_row, ty, &to_cache)
+    let ids: Vec<(i64, String)> = to_cache
+        .iter()
+        .map(|(id, jmap_id, _)| (*id, jmap_id.clone()))
+        .collect();
+    db::export_ids::upsert_many(&ctx.conn, target_row, ty, &ids)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    // Records the keywords Email/import was just given as the initial
+    // baseline, so a later run's diff against `keywords_synced` has
+    // something accurate to compare instead of starting from an unrecorded
+    // NULL (which reads as "unchanged" and would silently miss a
+    // subsequent real keyword change at the source -- see
+    // `keywords_need_sync`).
+    let baselines: Vec<(i64, Vec<String>)> = to_cache
+        .into_iter()
+        .map(|(id, _, keywords)| (id, keywords))
+        .collect();
+    db::export_ids::set_keywords_synced_many(&ctx.conn, target_row, &baselines)
         .map_err(|e| Error::Partial(e.to_string()))
 }
 
@@ -589,6 +745,7 @@ fn one_result(net: &Net, cache: &BlobCache, job: ImportJob) -> ImportResult {
     ImportResult {
         cid: job.cid,
         hint: job.hint,
+        keywords: job.keywords.keys().cloned().collect(),
         outcome,
     }
 }
@@ -700,6 +857,7 @@ fn import_uploaded(
             .map(|job| ImportResult {
                 cid: job.cid.clone(),
                 hint: job.hint.clone(),
+                keywords: job.keywords.keys().cloned().collect(),
                 outcome: batch_outcome(&job.cid, blobs, &imported),
             })
             .collect(),
@@ -843,15 +1001,16 @@ fn account(
     res: ImportResult,
     counts: &mut TypeCounts,
     logger: &Logger,
-    to_cache: &mut Vec<(i64, String)>,
+    to_cache: &mut Vec<(i64, String, Vec<String>)>,
 ) {
     crate::progress::advance(1);
+    let keywords = res.keywords;
     match res.outcome {
         Ok(SingleImport::Created(jmap_id)) => {
             counts.created += 1;
             if let Some(local_id) = res.cid.strip_prefix('e').and_then(|s| s.parse::<i64>().ok())
             {
-                to_cache.push((local_id, jmap_id));
+                to_cache.push((local_id, jmap_id, normalize_keywords(&keywords)));
             }
         }
         Ok(SingleImport::Skipped) => counts.skipped += 1,
@@ -1087,6 +1246,7 @@ mod tests {
         ImportResult {
             cid: "e1".to_string(),
             hint: "no message-id, 2 B".to_string(),
+            keywords: Vec::new(),
             outcome: Ok(SingleImport::NotCreated {
                 error_type: error_type.to_string(),
                 detail: "Blob does not contain a valid RFC 5322 message.".to_string(),
@@ -1129,5 +1289,55 @@ mod tests {
     fn other_not_created_reasons_are_not_retryable() {
         assert!(!is_retryable_not_created(&not_created("invalidEmail")));
         assert!(!is_retryable_not_created(&not_created("someOtherError")));
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_keywords_sorts_and_dedups() {
+        assert_eq!(
+            normalize_keywords(&s(&["$flagged", "$seen", "$flagged"])),
+            s(&["$flagged", "$seen"])
+        );
+    }
+
+    #[test]
+    fn no_baseline_and_seen_needs_no_sync() {
+        // Pre-existing row from before this feature shipped: no baseline
+        // recorded, and it's not currently unseen -- adopt silently, no
+        // retroactive push.
+        assert!(!keywords_need_sync(&s(&["$seen"]), None));
+    }
+
+    #[test]
+    fn no_baseline_but_unseen_still_needs_sync() {
+        // Same "never recorded" case, but currently unseen at the source --
+        // the unseen condition applies regardless of whether we have a
+        // baseline to diff against.
+        assert!(keywords_need_sync(&s(&[]), None));
+    }
+
+    #[test]
+    fn unchanged_seen_keywords_need_no_sync() {
+        let baseline = s(&["$seen"]);
+        assert!(!keywords_need_sync(&s(&["$seen"]), Some(&baseline)));
+    }
+
+    #[test]
+    fn changed_keywords_need_sync() {
+        let baseline = s(&["$seen"]);
+        assert!(keywords_need_sync(&s(&["$seen", "$flagged"]), Some(&baseline)));
+    }
+
+    #[test]
+    fn unseen_at_source_always_needs_sync_even_with_a_matching_baseline() {
+        // The self-healing case: source has been unseen all along (baseline
+        // agrees), but a target-side test read may have flipped it to seen
+        // there -- keep reasserting unseen every run regardless of whether
+        // the source itself changed.
+        let baseline: Vec<String> = s(&[]);
+        assert!(keywords_need_sync(&s(&[]), Some(&baseline)));
     }
 }

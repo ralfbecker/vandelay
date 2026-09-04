@@ -134,6 +134,56 @@ pub fn set_email_state(
     Ok(())
 }
 
+/// Every local id's last-synced keyword snapshot, for Email rows that have
+/// one. A row with a NULL `keywords_synced` (never recorded -- created
+/// before this column existed) is simply absent from the result, distinct
+/// from a row recorded with an empty keyword set.
+pub fn email_synced_keywords(
+    conn: &Connection,
+    target_id: i64,
+) -> Result<HashMap<i64, Vec<String>>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT local_id, keywords_synced FROM export_target_ids
+         WHERE target_id = ?1 AND type_name = ?2 AND keywords_synced IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![target_id, ObjectType::Email.jmap_name()], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for r in rows {
+        let (local_id, json) = r?;
+        if let Ok(keywords) = serde_json::from_str::<Vec<String>>(&json) {
+            map.insert(local_id, keywords);
+        }
+    }
+    Ok(map)
+}
+
+/// Refreshes just the keyword baseline for rows whose keywords were just
+/// pushed to the target, leaving their `jmap_id` untouched. Rows must
+/// already exist (from a prior [`upsert`]/[`upsert_many`] call) -- a
+/// missing row is silently a no-op, since there's nothing to attach the
+/// baseline to.
+pub fn set_keywords_synced_many(
+    conn: &Connection,
+    target_id: i64,
+    rows: &[(i64, Vec<String>)],
+) -> Result<(), rusqlite::Error> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for (local_id, keywords) in rows {
+        let json = serde_json::to_string(keywords).unwrap_or_else(|_| "[]".to_owned());
+        tx.execute(
+            "UPDATE export_target_ids SET keywords_synced = ?1
+             WHERE target_id = ?2 AND type_name = ?3 AND local_id = ?4",
+            params![json, target_id, ObjectType::Email.jmap_name(), local_id],
+        )?;
+    }
+    tx.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +304,46 @@ mod tests {
         let t = ensure_target(&c, "https://a/jmap", "w").unwrap();
         upsert(&c, t, ObjectType::Email, 1, "email-1").unwrap();
         assert!(all_for_type(&c, t, ObjectType::Mailbox).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_row_upserted_without_keywords_has_no_synced_baseline() {
+        let c = mem();
+        let t = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        upsert(&c, t, ObjectType::Email, 1, "e1").unwrap();
+        assert_eq!(email_synced_keywords(&c, t).unwrap().get(&1), None);
+    }
+
+    #[test]
+    fn set_keywords_synced_many_updates_baseline_without_touching_jmap_id() {
+        let c = mem();
+        let t = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        upsert(&c, t, ObjectType::Email, 1, "e1").unwrap();
+        set_keywords_synced_many(&c, t, &[(1, vec!["$seen".to_owned(), "$flagged".to_owned()])])
+            .unwrap();
+        let synced = email_synced_keywords(&c, t).unwrap();
+        assert_eq!(
+            synced.get(&1),
+            Some(&vec!["$seen".to_owned(), "$flagged".to_owned()])
+        );
+        assert_eq!(all_for_type(&c, t, ObjectType::Email).unwrap()[&1], "e1");
+    }
+
+    #[test]
+    fn set_keywords_synced_many_on_a_missing_row_is_a_no_op() {
+        let c = mem();
+        let t = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        set_keywords_synced_many(&c, t, &[(1, vec!["$seen".to_owned()])]).unwrap();
+        assert!(email_synced_keywords(&c, t).unwrap().is_empty());
+    }
+
+    #[test]
+    fn synced_keywords_are_scoped_per_target() {
+        let c = mem();
+        let a = ensure_target(&c, "https://a/jmap", "w").unwrap();
+        let b = ensure_target(&c, "https://b/jmap", "w").unwrap();
+        upsert(&c, a, ObjectType::Email, 1, "e1").unwrap();
+        set_keywords_synced_many(&c, a, &[(1, vec!["$seen".to_owned()])]).unwrap();
+        assert!(email_synced_keywords(&c, b).unwrap().is_empty());
     }
 }

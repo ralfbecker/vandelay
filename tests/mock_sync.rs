@@ -1230,7 +1230,7 @@ fn export_email_assume_not_deleted_skips_existence_verification() {
             let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
             conn.execute(
                 "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
-                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
                 rusqlite::params![blob],
             )
             .unwrap();
@@ -1345,7 +1345,7 @@ fn export_email_assume_not_deleted_creates_new_rows_without_full_target_fetch() 
             let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
             conn.execute(
                 "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
-                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
                 rusqlite::params![blob],
             )
             .unwrap();
@@ -1476,7 +1476,7 @@ fn export_email_matching_target_state_skips_verification_with_no_flag() {
             let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
             conn.execute(
                 "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
-                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
                 rusqlite::params![blob],
             )
             .unwrap();
@@ -1584,7 +1584,7 @@ fn export_email_mismatched_target_state_falls_back_to_verification() {
             let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
             conn.execute(
                 "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
-                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
                 rusqlite::params![blob],
             )
             .unwrap();
@@ -1696,7 +1696,7 @@ fn export_email_prune_removes_source_deleted_and_forgets_cache_row() {
             let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
             conn.execute(
                 "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
-                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
                 rusqlite::params![blob],
             )
             .unwrap();
@@ -2644,7 +2644,7 @@ fn export_missing_target_email_is_created_on_rerun() {
             );
             conn.execute(
                 "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords,message_match)
-                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]', ?2)",
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]', ?2)",
                 rusqlite::params![blob, mm],
             )
             .unwrap();
@@ -2759,7 +2759,7 @@ fn export_email_blake3_fallback_matches_when_no_message_id() {
         );
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords,message_match)
-             VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]', ?2)",
+             VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]', ?2)",
             rusqlite::params![blob, mm],
         )
         .unwrap();
