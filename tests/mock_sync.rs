@@ -1324,6 +1324,143 @@ fn export_email_assume_not_deleted_skips_existence_verification() {
     let _ = std::fs::remove_file(&archive);
 }
 
+/// `--assume-not-deleted-in-destination` never verifies a cached jmap_id
+/// against the target -- that's its whole documented risk -- so the
+/// keyword-sync push here can be the first thing to discover the cache is
+/// stale (e.g. the target account was recreated at some point). A `notFound`
+/// there must not be treated as a failure: the row should be recreated, its
+/// cache entry overwritten with the fresh id, and nothing counted skipped
+/// or failed for it.
+#[test]
+fn export_email_assume_not_deleted_recreates_a_message_whose_cached_id_is_stale() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        let raw = "From: a@x\r\nSubject: s1\r\nMessage-ID: <m1@h>\r\n\r\nbody 1";
+        let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
+        conn.execute(
+            "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+             VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        let target_id =
+            db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+        db::export_ids::upsert_many(
+            &conn,
+            target_id,
+            ObjectType::Email,
+            &[(1, "stale-1".to_owned())],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    let (_mq, _mq_end, _mg) = mock_matched_inbox(&mut server, api);
+
+    // The cached row is unseen, so the assume path attempts a keyword push
+    // for it (see keywords_need_sync) -- and the target reports it gone.
+    let set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/set".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/set",
+                {"accountId":"w","notUpdated":{"stale-1":{"type":"notFound"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let state_capture = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("\"ids\":\\[\\]".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",
+                {"accountId":"w","state":"s1","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+
+    let upload = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"BUP"}).to_string())
+        .expect(1)
+        .create();
+    let create = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e1":{"id":"fresh-1","blobId":"b","threadId":"t","size":10}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+            acl: false,
+            assume_not_deleted_in_destination: true,
+        },
+    )
+    .expect("export run");
+
+    set.assert();
+    upload.assert();
+    create.assert();
+    let _ = state_capture;
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.skipped, 0, "the stale row is recreated, not skipped");
+    assert_eq!(email.created, 1);
+    assert_eq!(
+        email.failed, 0,
+        "a stale cached id is self-healed, not counted as a failure"
+    );
+
+    let conn = db::init::open(&archive).unwrap();
+    let target_id =
+        db::export_ids::ensure_target(&conn, &format!("{base}/jmap/api"), "w").unwrap();
+    let cache = db::export_ids::all_for_type(&conn, target_id, ObjectType::Email).unwrap();
+    assert_eq!(
+        cache.get(&1),
+        Some(&"fresh-1".to_owned()),
+        "the stale mapping must be overwritten with the newly created id"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
 #[test]
 fn export_email_assume_not_deleted_creates_new_rows_without_full_target_fetch() {
     let mut server = mockito::Server::new();

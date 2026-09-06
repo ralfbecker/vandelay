@@ -76,11 +76,26 @@ fn keywords_need_sync(current_norm: &[String], synced: Option<&Vec<String>>) -> 
     changed || unseen
 }
 
+fn is_not_found(err: &Value) -> bool {
+    err.get("type").and_then(Value::as_str) == Some("notFound")
+}
+
 /// Pushes an `Email/set` keywords update for every matched row that
 /// [`keywords_need_sync`] flags, then records the pushed keywords as the new
 /// baseline for each row the target actually confirmed updated. Matched
 /// rows that don't need syncing are left untouched -- this is the only place
 /// Email export ever updates something it didn't just create.
+///
+/// Returns the local ids the target rejected with `notFound`: only
+/// `trust_cache_and_create` (the sole caller whose cached `jmap_id`s are
+/// never actually verified against the target -- that's its whole documented
+/// risk) can realistically hit this, when the cache is stale, so it's not
+/// counted as a failure here -- the caller re-routes those rows through
+/// `create_missing` instead, which recreates them and overwrites the stale
+/// mapping. `try_cached` and the full rebuild both confirm every id exists
+/// immediately before ever reaching this function, so they should never see
+/// one; if they somehow did, they currently just leave it in the returned
+/// list unread, which is safe (no double-counting, just no self-healing).
 #[allow(clippy::too_many_arguments)]
 fn sync_keywords(
     ctx: &Context,
@@ -91,9 +106,9 @@ fn sync_keywords(
     synced: &HashMap<i64, Vec<String>>,
     counts: &mut TypeCounts,
     logger: &Logger,
-) -> Result<(), Error> {
+) -> Result<Vec<i64>, Error> {
     if net.dry_run {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut update = Map::new();
     let mut by_jmap_id: HashMap<String, (i64, Vec<String>)> = HashMap::new();
@@ -110,7 +125,7 @@ fn sync_keywords(
         by_jmap_id.insert((*jmap_id).to_owned(), (*local_id, norm));
     }
     if update.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let outcome = match set_call(
         &net.client,
@@ -127,7 +142,7 @@ fn sync_keywords(
         Err(e) => {
             logger.warn(&format!("Email: syncing keywords failed: {e}"));
             counts.failed += by_jmap_id.len() as u64;
-            return Ok(());
+            return Ok(Vec::new());
         }
     };
     let mut to_persist: Vec<(i64, Vec<String>)> = Vec::new();
@@ -137,15 +152,26 @@ fn sync_keywords(
             to_persist.push((*local_id, norm.clone()));
         }
     }
+    let mut stale = Vec::new();
     for (id, err) in &outcome.not_updated {
-        logger.warn(&format!("Email {id}: could not sync keywords: {err}"));
-        counts.failed += 1;
+        let Some((local_id, _)) = by_jmap_id.get(id) else {
+            continue;
+        };
+        if is_not_found(err) {
+            logger.warn(&format!(
+                "Email {id}: cached target id no longer exists, recreating"
+            ));
+            stale.push(*local_id);
+        } else {
+            logger.warn(&format!("Email {id}: could not sync keywords: {err}"));
+            counts.failed += 1;
+        }
     }
     if !to_persist.is_empty() {
         db::export_ids::set_keywords_synced_many(&ctx.conn, target_row, &to_persist)
             .map_err(|e| Error::Partial(e.to_string()))?;
     }
-    Ok(())
+    Ok(stale)
 }
 
 /// The batched path creates blobs through a regular method call, so it never
@@ -469,16 +495,33 @@ fn trust_cache_and_create(
 ) -> Result<(), Error> {
     let mut to_create: Vec<(i64, &EmailRow)> = Vec::new();
     let mut matched: Vec<(i64, &str, &[String])> = Vec::new();
+    let mut local_by_id: HashMap<i64, &EmailRow> = HashMap::new();
     for (local_id, row) in local {
+        local_by_id.insert(*local_id, row);
         if let Some(jmap_id) = cached.get(local_id) {
-            counts.skipped += 1;
-            crate::progress::advance(1);
             matched.push((*local_id, jmap_id.as_str(), row.keywords.as_slice()));
         } else {
             to_create.push((*local_id, row));
         }
     }
-    sync_keywords(ctx, net, target_row, ty, &matched, synced, counts, logger)?;
+    // A cached jmap_id here is never actually verified against the target
+    // (that's this path's whole documented risk), so the keyword push above
+    // can be the first thing to discover it's stale. Route those rows
+    // through create_missing instead of counting them skipped -- it
+    // recreates them and its own cache write overwrites the stale mapping.
+    let stale: HashSet<i64> = sync_keywords(ctx, net, target_row, ty, &matched, synced, counts, logger)?
+        .into_iter()
+        .collect();
+    for &(local_id, _, _) in &matched {
+        if stale.contains(&local_id) {
+            if let Some(&row) = local_by_id.get(&local_id) {
+                to_create.push((local_id, row));
+            }
+        } else {
+            counts.skipped += 1;
+            crate::progress::advance(1);
+        }
+    }
     create_missing(ctx, net, maps, target_row, ty, &to_create, counts, logger)
 }
 
