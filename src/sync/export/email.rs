@@ -104,6 +104,7 @@ fn sync_keywords(
     ty: ObjectType,
     matched: &[(i64, &str, &[String])],
     synced: &HashMap<i64, Vec<String>>,
+    mailbox_labels: &HashMap<i64, String>,
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<Vec<i64>, Error> {
@@ -158,8 +159,12 @@ fn sync_keywords(
             continue;
         };
         if is_not_found(err) {
+            let label = mailbox_labels
+                .get(local_id)
+                .map(String::as_str)
+                .unwrap_or("?");
             logger.warn(&format!(
-                "Email {id}: cached target id no longer exists, recreating"
+                "Email {id}: cached target id no longer exists, recreating ({label})"
             ));
             stale.push(*local_id);
         } else {
@@ -226,6 +231,43 @@ fn load_local(ctx: &Context) -> Result<Vec<(i64, EmailRow)>, Error> {
     .collect::<Result<_, Error>>()
 }
 
+/// Local mailbox id -> a display label ("Trash (trash)", or just the name
+/// when there's no role), for the diagnostic mailbox context on a stale-id
+/// warning below.
+fn load_mailbox_labels(ctx: &Context) -> Result<HashMap<i64, String>, Error> {
+    let mut stmt = ctx
+        .conn
+        .prepare("SELECT id, name, role FROM mailboxes")
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let role: Option<String> = row.get(2)?;
+            let label = match role {
+                Some(role) => format!("{name} ({role})"),
+                None => name,
+            };
+            Ok((id, label))
+        })
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    rows.collect::<Result<_, _>>()
+        .map_err(|e| Error::Partial(e.to_string()))
+}
+
+/// Joins an email's mailbox labels for one log line, e.g. "Trash (trash)" or
+/// "Inbox, Archive" for a cross-listed message.
+fn mailbox_label(mailbox_locals: &[i64], names: &HashMap<i64, String>) -> String {
+    if mailbox_locals.is_empty() {
+        return "no mailbox".to_owned();
+    }
+    mailbox_locals
+        .iter()
+        .map(|id| names.get(id).map(String::as_str).unwrap_or("?"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn reconcile(
     ctx: &Context,
     net: &Net,
@@ -242,6 +284,11 @@ pub fn reconcile(
         .map_err(|e| Error::Partial(e.to_string()))?;
     let synced = db::export_ids::email_synced_keywords(&ctx.conn, target_row)
         .map_err(|e| Error::Partial(e.to_string()))?;
+    let mailbox_names = load_mailbox_labels(ctx)?;
+    let mailbox_labels: HashMap<i64, String> = local
+        .iter()
+        .map(|(id, row)| (*id, mailbox_label(&row.mailbox_locals, &mailbox_names)))
+        .collect();
 
     // Import never revives a local id, so any cache row whose local id is no
     // longer in the archive means that message was deleted at the source
@@ -252,7 +299,8 @@ pub fn reconcile(
 
     if !local.is_empty() {
         if let Some(mut plan) = try_state_proven_fast_path(
-            ctx, net, maps, target_row, ty, &local, &cached, &synced, counts, logger,
+            ctx, net, maps, target_row, ty, &local, &cached, &synced, &mailbox_labels, counts,
+            logger,
         )? {
             plan.prune_candidates = prune_candidates;
             plan.prune_local_ids = prune_local_ids;
@@ -273,7 +321,8 @@ pub fn reconcile(
             // mid-run can lose to a handful of in-flight batches rather
             // than the whole run.
             trust_cache_and_create(
-                ctx, net, maps, target_row, ty, &local, &cached, &synced, counts, logger,
+                ctx, net, maps, target_row, ty, &local, &cached, &synced, &mailbox_labels, counts,
+                logger,
             )?;
             record_state_for_next_run(ctx, net, target_row, logger);
             return Ok(Plan {
@@ -293,6 +342,7 @@ pub fn reconcile(
             &local,
             &cached,
             &synced,
+            &mailbox_labels,
             ctx.common.threads,
             counts,
             logger,
@@ -385,7 +435,17 @@ pub fn reconcile(
     // (rather than recovered from a prior run's cache) has no
     // `export_target_ids` row yet, and `sync_keywords`'s baseline update is
     // an UPDATE, not an upsert -- it needs that row to already exist.
-    sync_keywords(ctx, net, target_row, ty, &matched_kw, &synced, counts, logger)?;
+    sync_keywords(
+        ctx,
+        net,
+        target_row,
+        ty,
+        &matched_kw,
+        &synced,
+        &mailbox_labels,
+        counts,
+        logger,
+    )?;
     record_state_for_next_run(ctx, net, target_row, logger);
 
     Ok(Plan {
@@ -416,6 +476,7 @@ fn try_state_proven_fast_path(
     local: &[(i64, EmailRow)],
     cached: &HashMap<i64, String>,
     synced: &HashMap<i64, Vec<String>>,
+    mailbox_labels: &HashMap<i64, String>,
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<Option<Plan>, Error> {
@@ -447,7 +508,17 @@ fn try_state_proven_fast_path(
     }
 
     trust_cache_and_create(
-        ctx, net, maps, target_row, ty, local, cached, synced, counts, logger,
+        ctx,
+        net,
+        maps,
+        target_row,
+        ty,
+        local,
+        cached,
+        synced,
+        mailbox_labels,
+        counts,
+        logger,
     )?;
     record_state_for_next_run(ctx, net, target_row, logger);
 
@@ -490,6 +561,7 @@ fn trust_cache_and_create(
     local: &[(i64, EmailRow)],
     cached: &HashMap<i64, String>,
     synced: &HashMap<i64, Vec<String>>,
+    mailbox_labels: &HashMap<i64, String>,
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<(), Error> {
@@ -509,9 +581,19 @@ fn trust_cache_and_create(
     // can be the first thing to discover it's stale. Route those rows
     // through create_missing instead of counting them skipped -- it
     // recreates them and its own cache write overwrites the stale mapping.
-    let stale: HashSet<i64> = sync_keywords(ctx, net, target_row, ty, &matched, synced, counts, logger)?
-        .into_iter()
-        .collect();
+    let stale: HashSet<i64> = sync_keywords(
+        ctx,
+        net,
+        target_row,
+        ty,
+        &matched,
+        synced,
+        mailbox_labels,
+        counts,
+        logger,
+    )?
+    .into_iter()
+    .collect();
     for &(local_id, _, _) in &matched {
         if stale.contains(&local_id) {
             if let Some(&row) = local_by_id.get(&local_id) {
@@ -686,6 +768,7 @@ fn try_cached(
     local: &[(i64, EmailRow)],
     cached: &HashMap<i64, String>,
     synced: &HashMap<i64, Vec<String>>,
+    mailbox_labels: &HashMap<i64, String>,
     threads: usize,
     counts: &mut TypeCounts,
     logger: &Logger,
@@ -705,7 +788,17 @@ fn try_cached(
         .iter()
         .map(|(local_id, row)| (*local_id, cached[local_id].as_str(), row.keywords.as_slice()))
         .collect();
-    sync_keywords(ctx, net, target_row, ty, &matched, synced, counts, logger)?;
+    sync_keywords(
+        ctx,
+        net,
+        target_row,
+        ty,
+        &matched,
+        synced,
+        mailbox_labels,
+        counts,
+        logger,
+    )?;
     for _ in local {
         counts.skipped += 1;
     }
@@ -1382,5 +1475,24 @@ mod tests {
         // the source itself changed.
         let baseline: Vec<String> = s(&[]);
         assert!(keywords_need_sync(&s(&[]), Some(&baseline)));
+    }
+
+    #[test]
+    fn mailbox_label_shows_role_when_present() {
+        let names: HashMap<i64, String> = [(1, "Trash (trash)".to_owned())].into();
+        assert_eq!(mailbox_label(&[1], &names), "Trash (trash)");
+    }
+
+    #[test]
+    fn mailbox_label_joins_cross_listed_mailboxes() {
+        let names: HashMap<i64, String> =
+            [(1, "Inbox".to_owned()), (2, "Archive".to_owned())].into();
+        assert_eq!(mailbox_label(&[1, 2], &names), "Inbox, Archive");
+    }
+
+    #[test]
+    fn mailbox_label_handles_no_mailbox() {
+        let names: HashMap<i64, String> = HashMap::new();
+        assert_eq!(mailbox_label(&[], &names), "no mailbox");
     }
 }
