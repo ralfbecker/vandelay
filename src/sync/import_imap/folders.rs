@@ -53,6 +53,10 @@ pub struct FolderFilters {
     pub subscribed_only: bool,
     pub automap_enabled: bool,
     pub namespace_prefix: String,
+    /// Names of the other-users/shared namespace roots (NAMESPACE minus the trailing delimiter,
+    /// eg. "user"): a folder with exactly that name, no messages and nothing listed below it is
+    /// the server's doorway into other accounts, not a mailbox of this one, and is dropped.
+    pub foreign_namespace_roots: Vec<String>,
 }
 
 pub fn collect_from_list(
@@ -145,6 +149,8 @@ pub fn apply_filters(
     if filters.subscribed_only {
         keep.retain(|f| f.subscribed);
     }
+    let names: Vec<String> = keep.iter().map(|f| f.name.clone()).collect();
+    keep.retain(|f| !is_empty_foreign_root(f, &names, filters));
     let mut resolved: Vec<ResolvedFolder> = Vec::with_capacity(keep.len());
     for f in keep {
         let role = automap::role_for_folder(
@@ -175,6 +181,22 @@ pub fn apply_filters(
         });
     }
     resolved
+}
+
+fn is_empty_foreign_root(f: &DiscoveredFolder, names: &[String], filters: &FolderFilters) -> bool {
+    let Some(delim) = f.delimiter else {
+        return false;
+    };
+    filters
+        .foreign_namespace_roots
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(&f.name))
+        && f.status
+            .as_ref()
+            .is_none_or(|s| s.messages.unwrap_or(0) == 0)
+        && !names
+            .iter()
+            .any(|n| n.len() > f.name.len() && n.starts_with(&format!("{}{delim}", f.name)))
 }
 
 fn match_filters(name: &str, filters: &FolderFilters) -> bool {
@@ -318,6 +340,7 @@ mod tests {
             subscribed_only: false,
             automap_enabled: true,
             namespace_prefix: String::new(),
+            foreign_namespace_roots: Vec::new(),
         }
     }
 
@@ -530,5 +553,37 @@ mod tests {
         ];
         let folders = collect_from_list(&resps, false).unwrap();
         assert_eq!(folders.len(), 1);
+    }
+
+    #[test]
+    fn empty_foreign_namespace_root_is_dropped() {
+        let folders = collect_from_list(
+            &[
+                lst("INBOX", "/", &[]),
+                lst("user", "/", &["\\Noselect"]),
+                lst("users", "/", &[]),
+            ],
+            false,
+        )
+        .unwrap();
+        let mut filters = filters_default();
+        filters.foreign_namespace_roots = vec!["user".to_owned()];
+        let names: Vec<_> = apply_filters(folders, &filters)
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, ["INBOX", "users"]);
+    }
+
+    #[test]
+    fn foreign_namespace_root_with_children_is_kept() {
+        let folders = collect_from_list(
+            &[lst("user", "/", &["\\Noselect"]), lst("user/bob", "/", &[])],
+            false,
+        )
+        .unwrap();
+        let mut filters = filters_default();
+        filters.foreign_namespace_roots = vec!["user".to_owned()];
+        assert_eq!(apply_filters(folders, &filters).len(), 2);
     }
 }

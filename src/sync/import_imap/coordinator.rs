@@ -298,7 +298,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
         logger,
     };
 
-    let namespace_prefix = discover_namespace(&mut client, logger)?;
+    let (namespace_prefix, foreign_namespace_roots) = discover_namespace(&mut client, logger)?;
 
     let extended_supported = client.has_capability("LIST-EXTENDED");
     let special_use_supported = client.has_capability("SPECIAL-USE");
@@ -336,6 +336,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
         subscribed_only: config.subscribed_only,
         automap_enabled: config.automap,
         namespace_prefix,
+        foreign_namespace_roots,
     };
     let mut resolved = apply_filters(discovered, &filters);
     sort_by_depth(&mut resolved);
@@ -634,9 +635,16 @@ fn is_auth_failed(e: &ImapError) -> bool {
     }
 }
 
-fn discover_namespace(client: &mut ImapClient, logger: Logger) -> Result<String, Error> {
+/// The personal namespace prefix, plus the bare names (prefix without its trailing delimiter) of
+/// the other-users and shared namespaces: LIST "" "*" can report those as an empty placeholder
+/// folder (eg. Dovecot's "user"), which is a doorway into other accounts, not a mailbox of this
+/// one (see `FolderFilters::foreign_namespace_roots`).
+fn discover_namespace(
+    client: &mut ImapClient,
+    logger: Logger,
+) -> Result<(String, Vec<String>), Error> {
     if !client.has_capability("NAMESPACE") {
-        return Ok(String::new());
+        return Ok((String::new(), Vec::new()));
     }
     let resp = match client.run_collect(command::namespace()) {
         Ok(r) => r,
@@ -646,17 +654,36 @@ fn discover_namespace(client: &mut ImapClient, logger: Logger) -> Result<String,
                 LEVEL_PROGRESS,
                 &format!("NAMESPACE failed, ignoring: {e}"),
             );
-            return Ok(String::new());
+            return Ok((String::new(), Vec::new()));
         }
     };
     for u in resp.untagged {
-        if let Untagged::Namespace { personal, .. } = u
-            && let Some(NamespaceEntry { prefix, .. }) = personal.into_iter().next()
+        if let Untagged::Namespace {
+            personal,
+            others,
+            shared,
+        } = u
         {
-            return Ok(prefix);
+            let prefix = personal
+                .into_iter()
+                .next()
+                .map(|e| e.prefix)
+                .unwrap_or_default();
+            let roots = others
+                .into_iter()
+                .chain(shared)
+                .filter_map(|NamespaceEntry { prefix, delimiter }| {
+                    let root = match delimiter {
+                        Some(d) => prefix.strip_suffix(d).unwrap_or(&prefix),
+                        None => &prefix,
+                    };
+                    (!root.is_empty()).then(|| root.to_owned())
+                })
+                .collect();
+            return Ok((prefix, roots));
         }
     }
-    Ok(String::new())
+    Ok((String::new(), Vec::new()))
 }
 
 fn upsert_mailboxes(
