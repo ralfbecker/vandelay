@@ -141,9 +141,13 @@ pub fn row_to_mailbox(row: &Row, resolver: &impl TargetResolver) -> Result<Mailb
         ),
         None => None,
     };
+    // JMAP servers (Stalwart) silently strip leading and trailing whitespace of a mailbox name, so send it that way:
+    // everything looking the folder up by its name later (ACLs, subscriptions) then has to apply the same trimming
+    let name: String = row.get(1)?;
+    let trimmed = name.trim();
     Ok(Mailbox {
         id: None,
-        name: row.get(1)?,
+        name: if trimmed.is_empty() { name } else { trimmed.to_owned() },
         parent_id,
         role: row.get(3)?,
         sort_order: row.get::<_, i64>(4)? as u32,
@@ -953,6 +957,35 @@ mod tests {
             .unwrap();
         assert_eq!(wire.name, "Child");
         assert_eq!(wire.parent_id, Some(JmapId("TGT1".to_owned())));
+    }
+
+    #[test]
+    fn mailbox_name_is_exported_without_leading_and_trailing_whitespace() {
+        let c = mem();
+        let empty = MapResolver {
+            to_local: HashMap::new(),
+            to_target: HashMap::new(),
+        };
+        for (name, expected) in [
+            ("Diana ", "Diana"),
+            (" Abteilungkonferenz", "Abteilungkonferenz"),
+            (" a b ", "a b"),
+            ("Plain", "Plain"),
+            ("  ", "  "),
+        ] {
+            let mb: Mailbox =
+                serde_json::from_value(serde_json::json!({ "id": "M", "name": name })).unwrap();
+            let local = insert_mailbox(&c, &mb, &empty).unwrap();
+            let wire = c
+                .query_row(
+                    &format!("{MAILBOX_SELECT} WHERE id = ?1"),
+                    params![local],
+                    |row| Ok(row_to_mailbox(row, &empty)),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(wire.name, expected, "name {name:?}");
+        }
     }
 
     #[test]

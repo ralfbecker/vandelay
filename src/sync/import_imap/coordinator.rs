@@ -686,6 +686,28 @@ fn discover_namespace(
     Ok((String::new(), Vec::new()))
 }
 
+/// Folder name without leading and trailing whitespace, as the export sends it (a JMAP server like Stalwart
+/// strips it anyway). Unchanged, if a sibling with the trimmed name already exists (`UNIQUE (parent_id, name)`):
+/// the export merges such folders on the target.
+fn trimmed_leaf(
+    conn: &Connection,
+    leaf: &str,
+    parent: Option<i64>,
+    own_id: Option<i64>,
+) -> Result<String, Error> {
+    let trimmed = leaf.trim();
+    if trimmed.is_empty() || trimmed == leaf {
+        return Ok(leaf.to_owned());
+    }
+    let taken: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE name = ?1 AND parent_id IS ?2
+         AND (?3 IS NULL OR id <> ?3))",
+        params![trimmed, parent, own_id],
+        |r| r.get(0),
+    )?;
+    Ok(if taken { leaf } else { trimmed }.to_owned())
+}
+
 fn upsert_mailboxes(
     conn: &mut Connection,
     source_id: i64,
@@ -704,13 +726,14 @@ fn upsert_mailboxes(
             None => None,
         };
         let existing = db::imap_ids::local_for_mailbox(&tx, source_id, &folder.name)?;
+        let leaf = trimmed_leaf(&tx, &folder.leaf, parent_local, existing)?;
         let id = if let Some(id) = existing {
             let role = db::roles::unique_role(&tx, folder.role, Some(id))?;
             tx.execute(
                 "UPDATE mailboxes SET name = ?1, parent_id = ?2, role = ?3,
                  is_subscribed = ?4 WHERE id = ?5",
                 params![
-                    folder.leaf,
+                    leaf,
                     parent_local,
                     role,
                     folder.subscribed as i64,
@@ -723,7 +746,7 @@ fn upsert_mailboxes(
             tx.execute(
                 "INSERT INTO mailboxes (name, parent_id, role, sort_order, is_subscribed)
                  VALUES (?1, ?2, ?3, 0, ?4)",
-                params![folder.leaf, parent_local, role, folder.subscribed as i64],
+                params![leaf, parent_local, role, folder.subscribed as i64],
             )?;
             let new_id = tx.last_insert_rowid();
             db::imap_ids::insert_mailbox(&tx, source_id, &folder.name, new_id)?;
@@ -1352,6 +1375,28 @@ fn dry_run_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimmed_leaf_trims_unless_a_sibling_has_that_name() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::init::apply_schema(&c).unwrap();
+        c.execute("INSERT INTO mailboxes (name, parent_id) VALUES ('Diana', NULL)", [])
+            .unwrap();
+        c.execute("INSERT INTO mailboxes (name, parent_id) VALUES ('Other ', NULL)", [])
+            .unwrap();
+        let other: i64 = c
+            .query_row("SELECT id FROM mailboxes WHERE name = 'Other '", [], |r| r.get(0))
+            .unwrap();
+        // a sibling "Diana" exists: keep the name with the blank (the export merges them)
+        assert_eq!(trimmed_leaf(&c, "Diana ", None, None).unwrap(), "Diana ");
+        // no sibling of that name (or it is the folder itself): trim
+        assert_eq!(trimmed_leaf(&c, "Other ", None, Some(other)).unwrap(), "Other");
+        assert_eq!(trimmed_leaf(&c, " New", None, None).unwrap(), "New");
+        // below another parent "Diana" does not exist
+        assert_eq!(trimmed_leaf(&c, "Diana ", Some(other), None).unwrap(), "Diana");
+        assert_eq!(trimmed_leaf(&c, "Plain", None, None).unwrap(), "Plain");
+        assert_eq!(trimmed_leaf(&c, "  ", None, None).unwrap(), "  ");
+    }
 
     #[test]
     fn parse_endpoint_imaps_defaults_to_993() {
