@@ -57,6 +57,36 @@ fn uids_via_fetch(client: &mut ImapClient) -> Result<Vec<u32>, ImapError> {
     Ok(out)
 }
 
+/// Largest message that fits into the archive: SQLite's default limit for a
+/// single BLOB is 1,000,000,000 bytes (SQLITE_MAX_LENGTH), keep a little slack.
+pub const MAX_MESSAGE_BYTES: u64 = 999_000_000;
+
+/// Return the `(uid, size)` of those of `uids` whose RFC822.SIZE exceeds
+/// [`MAX_MESSAGE_BYTES`], asking the server for sizes only (no bodies).
+pub fn oversize_uids(
+    client: &mut ImapClient,
+    uids: &[u32],
+) -> Result<Vec<(u32, u64)>, ImapError> {
+    let mut out = Vec::new();
+    for chunk in uids.chunks(1000) {
+        let set = chunk
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let resp = client.run_collect(&command::uid_fetch(&set, &["UID", "RFC822.SIZE"]))?;
+        for u in &resp.untagged {
+            if let Some(attrs) = super::fetch::extract(u)
+                && let (Some(uid), Some(size)) = (attrs.uid, attrs.size)
+                && size > MAX_MESSAGE_BYTES
+            {
+                out.push((uid, size));
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UidDiff {
     pub new: Vec<u32>,

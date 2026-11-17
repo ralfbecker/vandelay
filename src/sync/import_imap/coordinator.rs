@@ -898,7 +898,40 @@ fn reconcile_folder(
         .map_err(|e| Error::Partial(format!("UID enum {:?}: {e}", folder.name)))?;
     let local_uids =
         db::imap_ids::email_uids_at_validity(conn, source_id, &folder.name, uidvalidity)?;
-    let diff = diff_uids(&local_uids, &server_uids);
+    let mut diff = diff_uids(&local_uids, &server_uids);
+
+    // A message above SQLite's BLOB limit can not be archived: skip it with a
+    // warning instead of downloading it (every run) just to fail on insert.
+    if !diff.new.is_empty() {
+        match call_with_retry(client, control_ctx, |c| {
+            super::messages::oversize_uids(c, &diff.new)
+        }) {
+            Ok(oversize) if !oversize.is_empty() => {
+                for (uid, size) in &oversize {
+                    log_at(
+                        logger,
+                        LEVEL_DEFAULT,
+                        &format!(
+                            "WARNING folder {:?} uid {uid}: {size} bytes are more than the {} bytes an archive can hold, NOT imported",
+                            folder.name,
+                            super::messages::MAX_MESSAGE_BYTES
+                        ),
+                    );
+                }
+                let skip: std::collections::HashSet<u32> =
+                    oversize.iter().map(|(uid, _)| *uid).collect();
+                diff.new.retain(|uid| !skip.contains(uid));
+                counts.skipped += oversize.len() as u64;
+            }
+            Ok(_) => {}
+            // sizes are only an optimization, the insert guard below still protects the archive
+            Err(e) => log_at(
+                logger,
+                LEVEL_DEFAULT,
+                &format!("folder {:?}: size check failed: {e}", folder.name),
+            ),
+        }
+    }
 
     log_at(
         logger,
@@ -1111,6 +1144,19 @@ fn insert_single_message(
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
     };
+    if body.len() as u64 > super::messages::MAX_MESSAGE_BYTES {
+        log_at(
+            logger,
+            LEVEL_DEFAULT,
+            &format!(
+                "WARNING folder {folder:?} uid {uid}: {} bytes are more than the {} bytes an archive can hold, NOT imported",
+                body.len(),
+                super::messages::MAX_MESSAGE_BYTES
+            ),
+        );
+        counts.skipped += 1;
+        return Ok(());
+    }
     let blob_id = db::blobs::intern_blob(tx, body)?;
     let message_match = index_to_json(&email_index_from_blob(body));
     let mailbox_ids = Value::Array(vec![Value::from(mailbox_local)]);
