@@ -168,6 +168,8 @@ vandelay import imap \
 
 Imports mail (and only mail) from any IMAP server. Folder selection is via `--include`/`--exclude` regexes (mutually exclusive with the exact-match `--folder`); `--exclude-special` drops by SPECIAL-USE role.
 
+Memory and transaction size are bounded, whatever the size of a mailbox: fetched message bodies waiting for the single SQLite writer are limited to 256 MiB (`VANDELAY_IMAP_BUFFER_MB`; a message larger than that is still admitted when nothing else is waiting), and the writer commits at the latest every 5,000 messages or 128 MiB (`VANDELAY_IMAP_COMMIT_MSGS`, `VANDELAY_IMAP_COMMIT_MB`), so the WAL stays small and an interrupted run keeps what was stored (the next run only fetches the rest). Responses are retried only when the server's response code or text says the failure is temporary: `NONEXISTENT`, `NOPERM` and the like are never retried, and a mailbox *name* containing "temp" does not count as a temporary failure.
+
 #### CalDAV
 
 ```

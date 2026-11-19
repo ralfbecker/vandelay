@@ -349,4 +349,21 @@ mod tests {
         let _ = s.transport_delay(2);
         assert_eq!(s.transport_retries(), 2);
     }
+
+    #[test]
+    fn nonexistent_mailbox_with_temp_in_its_name_is_permanent_not_transient() {
+        let e = ImapError::No(NoError::new(
+            "Mailbox doesn't exist: INBOX/Wiederherge  29-temp-1",
+            Some("NONEXISTENT".into()),
+        ));
+        assert_eq!(classify(&e), Disposition::Permanent);
+    }
+
+    #[test]
+    fn unavailable_and_overquota_are_transient() {
+        for code in ["UNAVAILABLE", "OVERQUOTA"] {
+            let e = ImapError::No(NoError::new("busy", Some(code.into())));
+            assert_eq!(classify(&e), Disposition::Transient, "{code}");
+        }
+    }
 }

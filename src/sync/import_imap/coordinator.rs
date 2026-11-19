@@ -49,6 +49,53 @@ pub(super) struct RunOpts {
     fetch_batch: usize,
     include_deleted: bool,
     logger: Logger,
+    commit: CommitPolicy,
+}
+
+/// When `reconcile_folder` commits the messages inserted so far, instead of once per folder.
+///
+/// One transaction per folder meant that a mailbox with 320,000 messages was one uncommitted transaction:
+/// the SQLite WAL grew to 25 GB (it can not be checkpointed during a transaction) and a killed
+/// or failed run lost the whole folder. The import is convergent (the next run only fetches what is
+/// missing), so committing in between is safe: the folder's state (UIDNEXT) is only written at its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CommitPolicy {
+    pub max_messages: usize,
+    pub max_bytes: usize,
+}
+
+impl CommitPolicy {
+    pub const DEFAULT_MESSAGES: usize = 5_000;
+    pub const DEFAULT_MB: usize = 128;
+
+    /// `VANDELAY_IMAP_COMMIT_MSGS` and `VANDELAY_IMAP_COMMIT_MB` override the defaults.
+    pub fn from_env() -> Self {
+        let get = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            max_messages: get("VANDELAY_IMAP_COMMIT_MSGS", Self::DEFAULT_MESSAGES),
+            max_bytes: get("VANDELAY_IMAP_COMMIT_MB", Self::DEFAULT_MB).saturating_mul(1024 * 1024),
+        }
+    }
+
+    pub fn due(&self, messages: usize, bytes: usize) -> bool {
+        messages >= self.max_messages || bytes >= self.max_bytes
+    }
+}
+
+/// Makes sure the workers can never wait for a consumer that has left `reconcile_folder`.
+struct FolderGuard<'a>(&'a WorkerPool);
+
+impl Drop for FolderGuard<'_> {
+    fn drop(&mut self) {
+        // after a complete folder all events were consumed and this changes nothing
+        self.0.abort_folder();
+    }
 }
 
 #[derive(Clone)]
@@ -402,6 +449,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
         fetch_batch: config.fetch_batch.max(1),
         include_deleted: config.include_deleted,
         logger,
+        commit: CommitPolicy::from_env(),
     };
 
     let pool = WorkerPool::start(
@@ -416,6 +464,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
             logger,
         },
         config.imap_connections.max(1),
+        super::pool::buffer_limit_from_env(),
     )
     .map_err(|e| Error::Connection(format!("worker pool: {e}")))?;
 
@@ -456,6 +505,14 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
         }
     }
 
+    log_at(
+        logger,
+        LEVEL_PROGRESS,
+        &format!(
+            "peak of {} MiB fetched message data waiting to be stored",
+            pool.peak_buffered() / (1024 * 1024)
+        ),
+    );
     pool.shutdown();
     let _ = client.logout();
 
@@ -827,6 +884,7 @@ fn reconcile_folder(
         fetch_batch,
         include_deleted: _,
         logger,
+        commit,
     } = opts;
 
     if let Some(status) = folder.status.as_ref()
@@ -966,6 +1024,8 @@ fn reconcile_folder(
             })?;
         let batches: Vec<&[u32]> = chunks(&diff.new, fetch_batch);
         let n_batches = batches.len();
+        pool.begin_folder();
+        let _guard = FolderGuard(pool);
         for batch in &batches {
             pool.submit(FetchJob {
                 folder: folder.name.clone(),
@@ -975,7 +1035,9 @@ fn reconcile_folder(
         }
         let keepalive_interval = std::time::Duration::from_secs(45);
         let mut chunks_done: usize = 0;
-        let tx = conn.transaction()?;
+        let mut tx = conn.transaction()?;
+        let mut uncommitted_msgs: usize = 0;
+        let mut uncommitted_bytes: usize = 0;
         let target = FetchTarget {
             folder: folder.name.as_str(),
             uidvalidity,
@@ -999,8 +1061,20 @@ fn reconcile_folder(
                 }
             };
             match event {
-                FetchEvent::Item { attrs, .. } => {
-                    insert_single_message(&tx, &target, &attrs, opts, counts)?;
+                FetchEvent::Item { attrs, cost, .. } => {
+                    let stored = insert_single_message(&tx, &target, &attrs, opts, counts);
+                    drop(attrs);
+                    // the body is gone from memory now, let the fetch connections go on
+                    pool.release(cost);
+                    stored?;
+                    uncommitted_msgs += 1;
+                    uncommitted_bytes += cost;
+                    if commit.due(uncommitted_msgs, uncommitted_bytes) {
+                        tx.commit()?;
+                        tx = conn.transaction()?;
+                        uncommitted_msgs = 0;
+                        uncommitted_bytes = 0;
+                    }
                 }
                 FetchEvent::ChunkDone {
                     folder: chunk_folder,
@@ -1109,6 +1183,7 @@ fn insert_single_message(
         fetch_batch: _,
         include_deleted,
         logger,
+        commit: _,
     } = opts;
     let folder = target.folder;
     let uidvalidity = target.uidvalidity;
@@ -1199,6 +1274,7 @@ fn refresh_present_flags(
         fetch_batch,
         include_deleted,
         logger: _,
+        commit: _,
     } = opts;
     let mut updated: u64 = 0;
     let tx = conn.transaction()?;
@@ -1421,6 +1497,30 @@ fn dry_run_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_policy_is_due_by_message_count_or_bytes() {
+        let p = CommitPolicy {
+            max_messages: 100,
+            max_bytes: 1000,
+        };
+        assert!(!p.due(0, 0));
+        assert!(!p.due(99, 999));
+        assert!(p.due(100, 0));
+        assert!(p.due(1, 1000));
+        assert!(p.due(5, 5000));
+    }
+
+    #[test]
+    fn commit_policy_defaults() {
+        if std::env::var("VANDELAY_IMAP_COMMIT_MSGS").is_err()
+            && std::env::var("VANDELAY_IMAP_COMMIT_MB").is_err()
+        {
+            let p = CommitPolicy::from_env();
+            assert_eq!(p.max_messages, CommitPolicy::DEFAULT_MESSAGES);
+            assert_eq!(p.max_bytes, CommitPolicy::DEFAULT_MB * 1024 * 1024);
+        }
+    }
 
     #[test]
     fn trimmed_leaf_trims_unless_a_sibling_has_that_name() {
